@@ -1,0 +1,2020 @@
+--[[--
+AudioSpectrumAnalyzer.fuse
+DaVinci Resolve / Blackmagic Fusion FFT Audio Spectrum Analyzer Effect Plugin
+
+Supports:
+  - WAV formats: PCM 8-bit, 16-bit, 24-bit, 32-bit LE & IEEE Float 32/64-bit LE
+    (including WAVE_FORMAT_EXTENSIBLE)
+  - Streaming seek-based sample reads (supports multi-GB WAV files safely)
+  - True Radix-2 Cooley-Tukey FFT (1024 / 2048 / 4096 / 8192)
+  - Logarithmic & Linear frequency mapping + Tilt/Slope compensation
+  - Scrubbing-safe deterministic Attack/Release smoothing & Peak Hold
+  - 6 Visual Styles: Bars, Segmented LED, Line Curve, Filled Area, Circular Bars, Circular Line
+  - 4 Color Modes: Solid, Frequency Gradient, Level Meter, Rainbow
+--]]--
+
+FuRegisterClass("AudioSpectrumAnalyzer", CT_Tool, {
+    REGS_Name = "Audio Spectrum Analyzer",
+    REGS_Category = "Audio",
+    REGS_OpIconString = "ASA",
+    REGS_OpDescription = "FFT Audio Spectrum Analyzer Graph (WAV)",
+    REG_OpNoMask = false,
+    REG_NoBlendCtrls = false,
+    REG_TimeVariant = true,
+    REG_NoPreCalcProcess = true,
+    REG_Version = 100,
+})
+
+--------------------------------------------------------------------------------
+-- Constants & Global Caches (per Fusion instance)
+--------------------------------------------------------------------------------
+local LN10 = math.log(10.0)
+local LN2  = math.log(2.0)
+local TWO_PI = 2.0 * math.pi
+
+local WAV_HEADER_CACHE = {}
+local FFT_PLAN_CACHE = {}
+local SPECTRUM_FRAME_CACHE = {}
+local SPECTRUM_CACHE_ORDER = {}
+local MAX_FRAME_CACHE = 600
+
+--------------------------------------------------------------------------------
+-- Pure Lua Binary / WAV Parsing Utilities (Lua 5.1 / LuaJIT 2.1 / Lua 5.5 safe)
+--------------------------------------------------------------------------------
+local function read_u16_le(s, pos)
+    local b0, b1 = string.byte(s, pos, pos + 1)
+    return b0 + b1 * 256
+end
+
+local function read_u32_le(s, pos)
+    local b0, b1, b2, b3 = string.byte(s, pos, pos + 3)
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+end
+
+local function decode_f32_le(s, pos)
+    local b0, b1, b2, b3 = string.byte(s, pos, pos + 3)
+    local sign = (b3 >= 128) and -1.0 or 1.0
+    local exp = (b3 % 128) * 2 + math.floor(b2 / 128)
+    local mant = (b2 % 128) * 65536 + b1 * 256 + b0
+    if exp == 0 then
+        if mant == 0 then
+            return 0.0
+        end
+        return sign * (mant / 8388608.0) * (2 ^ -126)
+    elseif exp == 255 then
+        return 0.0
+    end
+    return sign * (1.0 + mant / 8388608.0) * (2 ^ (exp - 127))
+end
+
+local function decode_f64_le(s, pos)
+    local b0, b1, b2, b3, b4, b5, b6, b7 = string.byte(s, pos, pos + 7)
+    local sign = (b7 >= 128) and -1.0 or 1.0
+    local exp = (b7 % 128) * 16 + math.floor(b6 / 16)
+    local mant = (b6 % 16) * 281474976710656.0
+        + b5 * 1099511627776.0
+        + b4 * 4294967296.0
+        + b3 * 16777216.0
+        + b2 * 65536.0
+        + b1 * 256.0
+        + b0
+    if exp == 0 then
+        if mant == 0 then
+            return 0.0
+        end
+        return sign * (mant / 4503599627370496.0) * (2 ^ -1022)
+    elseif exp == 2047 then
+        return 0.0
+    end
+    return sign * (1.0 + mant / 4503599627370496.0) * (2 ^ (exp - 1023))
+end
+
+local function parse_wav_header(filepath)
+    if not filepath or filepath == "" then
+        return nil, "No file path"
+    end
+
+    local f, err = io.open(filepath, "rb")
+    if not f then
+        return nil, err or "Cannot open WAV file"
+    end
+
+    local file_size = f:seek("end")
+    f:seek("set", 0)
+
+    local cached = WAV_HEADER_CACHE[filepath]
+    if cached and cached.file_size == file_size then
+        f:close()
+        return cached
+    end
+
+    local riff = f:read(12)
+    if not riff or #riff < 12 then
+        f:close()
+        return nil, "Invalid WAV file (too short)"
+    end
+
+    local riff_id = string.sub(riff, 1, 4)
+    local wave_id = string.sub(riff, 9, 12)
+    if (riff_id ~= "RIFF" and riff_id ~= "RF64") or wave_id ~= "WAVE" then
+        f:close()
+        return nil, "Not a RIFF/WAVE file"
+    end
+
+    local fmt_info = nil
+    local data_offset = nil
+    local data_bytes = nil
+    local ds64_data_size = nil
+    local offset = 12
+
+    while offset + 8 <= file_size do
+        f:seek("set", offset)
+        local chdr = f:read(8)
+        if not chdr or #chdr < 8 then
+            break
+        end
+        local cid = string.sub(chdr, 1, 4)
+        local csize = read_u32_le(chdr, 5)
+
+        if cid == "ds64" and riff_id == "RF64" and csize >= 24 then
+            local dbytes = f:read(24)
+            if dbytes and #dbytes >= 16 then
+                local lo = read_u32_le(dbytes, 9)
+                local hi = read_u32_le(dbytes, 13)
+                ds64_data_size = lo + hi * 4294967296.0
+            end
+        elseif cid == "fmt " then
+            local fbytes = f:read(math.min(csize, 64))
+            if fbytes and #fbytes >= 16 then
+                local audio_fmt = read_u16_le(fbytes, 1)
+                local channels = read_u16_le(fbytes, 3)
+                local sample_rate = read_u32_le(fbytes, 5)
+                local block_align = read_u16_le(fbytes, 13)
+                local bits = read_u16_le(fbytes, 15)
+                local eff_fmt = audio_fmt
+                if audio_fmt == 0xFFFE and #fbytes >= 26 then
+                    eff_fmt = read_u16_le(fbytes, 25)
+                end
+                fmt_info = {
+                    audio_format = eff_fmt,
+                    channels = channels,
+                    sample_rate = sample_rate,
+                    block_align = block_align,
+                    bits_per_sample = bits,
+                }
+            end
+        elseif cid == "data" then
+            data_offset = offset + 8
+            local raw_csize = (csize == 4294967295 and ds64_data_size) and ds64_data_size or csize
+            data_bytes = math.min(raw_csize, math.max(0, file_size - data_offset))
+            if fmt_info then
+                break
+            end
+        end
+
+        local step = 8 + csize + (csize % 2)
+        if step < 8 then
+            break
+        end
+        offset = offset + step
+    end
+
+    f:close()
+
+    if not fmt_info or not data_offset then
+        return nil, "Missing fmt or data chunk"
+    end
+
+    if fmt_info.channels < 1 or fmt_info.sample_rate < 1 or fmt_info.block_align < 1 then
+        return nil, "Invalid WAV parameters"
+    end
+
+    local fmt = fmt_info.audio_format
+    local bits = fmt_info.bits_per_sample
+    local valid = (fmt == 1 and (bits == 8 or bits == 16 or bits == 24 or bits == 32))
+               or (fmt == 3 and (bits == 32 or bits == 64))
+    if not valid then
+        return nil, string.format("Unsupported WAV encoding (fmt=%d, bits=%d)", fmt, bits)
+    end
+
+    local total_samples = math.floor(data_bytes / fmt_info.block_align)
+    local info = {
+        filepath = filepath,
+        file_size = file_size,
+        audio_format = fmt,
+        channels = fmt_info.channels,
+        sample_rate = fmt_info.sample_rate,
+        block_align = fmt_info.block_align,
+        bits_per_sample = bits,
+        data_offset = data_offset,
+        data_bytes = data_bytes,
+        total_samples = total_samples,
+    }
+    WAV_HEADER_CACHE[filepath] = info
+    return info
+end
+
+local function decode_sample_at(buf, pos, fmt, bits)
+    if fmt == 1 then
+        if bits == 16 then
+            local b0, b1 = string.byte(buf, pos, pos + 1)
+            local v = b0 + b1 * 256
+            if v >= 32768 then v = v - 65536 end
+            return v / 32768.0
+        elseif bits == 24 then
+            local b0, b1, b2 = string.byte(buf, pos, pos + 2)
+            local v = b0 + b1 * 256 + b2 * 65536
+            if v >= 8388608 then v = v - 16777216 end
+            return v / 8388608.0
+        elseif bits == 32 then
+            local b0, b1, b2, b3 = string.byte(buf, pos, pos + 3)
+            local v = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+            if v >= 2147483648 then v = v - 4294967296 end
+            return v / 2147483648.0
+        elseif bits == 8 then
+            return (string.byte(buf, pos) - 128) / 128.0
+        end
+    elseif fmt == 3 then
+        if bits == 32 then
+            return decode_f32_le(buf, pos)
+        elseif bits == 64 then
+            return decode_f64_le(buf, pos)
+        end
+    end
+    return 0.0
+end
+
+local function read_wav_window(wav, start_sample, num_samples, channel_mode)
+    local out = {}
+    for i = 1, num_samples do
+        out[i] = 0.0
+    end
+
+    if not wav or wav.total_samples <= 0 then
+        return out
+    end
+
+    local end_sample = start_sample + num_samples - 1
+    if end_sample < 0 or start_sample >= wav.total_samples then
+        return out
+    end
+
+    local read_start = math.max(0, start_sample)
+    local read_end = math.min(wav.total_samples - 1, end_sample)
+    local read_count = read_end - read_start + 1
+    if read_count <= 0 then
+        return out
+    end
+
+    local f = io.open(wav.filepath, "rb")
+    if not f then
+        return out
+    end
+
+    f:seek("set", wav.data_offset + read_start * wav.block_align)
+    local raw = f:read(read_count * wav.block_align)
+    f:close()
+
+    if not raw then
+        return out
+    end
+
+    local actual_frames = math.floor(#raw / wav.block_align)
+    local fmt = wav.audio_format
+    local bits = wav.bits_per_sample
+    local bytes_per_sample = math.floor(bits / 8)
+    local ch_count = wav.channels
+    local block_align = wav.block_align
+    local dst_offset = (read_start - start_sample) + 1
+
+    if ch_count == 1 then
+        for i = 0, actual_frames - 1 do
+            local pos = i * block_align + 1
+            out[dst_offset + i] = decode_sample_at(raw, pos, fmt, bits)
+        end
+    elseif channel_mode == 1 then
+        -- Left
+        for i = 0, actual_frames - 1 do
+            local pos = i * block_align + 1
+            out[dst_offset + i] = decode_sample_at(raw, pos, fmt, bits)
+        end
+    elseif channel_mode == 2 then
+        -- Right
+        local ch_off = bytes_per_sample
+        for i = 0, actual_frames - 1 do
+            local pos = i * block_align + ch_off + 1
+            out[dst_offset + i] = decode_sample_at(raw, pos, fmt, bits)
+        end
+    else
+        -- Mix L+R (or all channels)
+        if ch_count == 2 then
+            for i = 0, actual_frames - 1 do
+                local pos = i * block_align + 1
+                local l = decode_sample_at(raw, pos, fmt, bits)
+                local r = decode_sample_at(raw, pos + bytes_per_sample, fmt, bits)
+                out[dst_offset + i] = 0.5 * (l + r)
+            end
+        else
+            local inv_ch = 1.0 / ch_count
+            for i = 0, actual_frames - 1 do
+                local base = i * block_align + 1
+                local acc = 0.0
+                for c = 0, ch_count - 1 do
+                    acc = acc + decode_sample_at(raw, base + c * bytes_per_sample, fmt, bits)
+                end
+                out[dst_offset + i] = acc * inv_ch
+            end
+        end
+    end
+
+    return out
+end
+
+--------------------------------------------------------------------------------
+-- Radix-2 Cooley-Tukey FFT with Cached Plans
+--------------------------------------------------------------------------------
+local function get_fft_plan(n, window_type)
+    local key = tostring(n) .. "_" .. tostring(window_type)
+    local cached = FFT_PLAN_CACHE[key]
+    if cached then
+        return cached
+    end
+
+    -- Bit-reversal permutation (1-based indices)
+    local bitrev = {}
+    local log2n = math.floor(math.log(n) / LN2 + 0.5)
+    for i = 0, n - 1 do
+        local rev = 0
+        local v = i
+        for _ = 1, log2n do
+            rev = rev * 2 + (v % 2)
+            v = math.floor(v / 2)
+        end
+        bitrev[i + 1] = rev + 1
+    end
+
+    -- Window coefficients + coherent gain
+    local win = {}
+    local win_sum = 0.0
+    local denom = n - 1
+    for i = 0, n - 1 do
+        local x = i / denom
+        local w
+        if window_type == 1 then
+            -- Hamming
+            w = 0.54 - 0.46 * math.cos(TWO_PI * x)
+        elseif window_type == 2 then
+            -- Blackman-Harris
+            w = 0.35875
+                - 0.48829 * math.cos(TWO_PI * x)
+                + 0.14128 * math.cos(2.0 * TWO_PI * x)
+                - 0.01168 * math.cos(3.0 * TWO_PI * x)
+        else
+            -- Hann (default)
+            w = 0.5 * (1.0 - math.cos(TWO_PI * x))
+        end
+        win[i + 1] = w
+        win_sum = win_sum + w
+    end
+
+    -- Single-sided FFT normalization so 0 dBFS sine wave peaks at ~1.0 (0 dBFS)
+    local norm = 2.0 / math.max(win_sum, 1.0)
+
+    -- Precompute stage twiddle tables
+    local stages = {}
+    local m = 2
+    while m <= n do
+        local half = m / 2
+        local step_angle = -TWO_PI / m
+        local wr_tbl = {}
+        local wi_tbl = {}
+        for j = 0, half - 1 do
+            local ang = j * step_angle
+            wr_tbl[j + 1] = math.cos(ang)
+            wi_tbl[j + 1] = math.sin(ang)
+        end
+        stages[#stages + 1] = {
+            m = m,
+            half = half,
+            wr = wr_tbl,
+            wi = wi_tbl,
+        }
+        m = m * 2
+    end
+
+    local plan = {
+        n = n,
+        bitrev = bitrev,
+        win = win,
+        norm = norm,
+        stages = stages,
+    }
+    FFT_PLAN_CACHE[key] = plan
+    return plan
+end
+
+local function compute_fft_magnitudes(samples, plan)
+    local n = plan.n
+    local bitrev = plan.bitrev
+    local win = plan.win
+    local re = {}
+    local im = {}
+
+    for i = 1, n do
+        local j = bitrev[i]
+        re[i] = samples[j] * win[j]
+        im[i] = 0.0
+    end
+
+    local stages = plan.stages
+    for s = 1, #stages do
+        local st = stages[s]
+        local m = st.m
+        local half = st.half
+        local wr_tbl = st.wr
+        local wi_tbl = st.wi
+        for k = 1, n, m do
+            for j = 1, half do
+                local idx1 = k + j - 1
+                local idx2 = idx1 + half
+                local wr = wr_tbl[j]
+                local wi = wi_tbl[j]
+                local tr = wr * re[idx2] - wi * im[idx2]
+                local ti = wr * im[idx2] + wi * re[idx2]
+                re[idx2] = re[idx1] - tr
+                im[idx2] = im[idx1] - ti
+                re[idx1] = re[idx1] + tr
+                im[idx1] = im[idx1] + ti
+            end
+        end
+    end
+
+    local half_n = math.floor(n / 2)
+    local mag = {}
+    local norm = plan.norm
+    mag[0] = math.sqrt(re[1] * re[1] + im[1] * im[1]) * norm * 0.5
+    for k = 1, half_n - 1 do
+        local r = re[k + 1]
+        local ii = im[k + 1]
+        mag[k] = math.sqrt(r * r + ii * ii) * norm
+    end
+    mag[half_n] = math.sqrt(re[half_n + 1] * re[half_n + 1] + im[half_n + 1] * im[half_n + 1]) * norm * 0.5
+    return mag, half_n
+end
+
+--------------------------------------------------------------------------------
+-- Spectrum Band Calculation + Deterministic Scrubbing-Safe Smoothing
+--------------------------------------------------------------------------------
+local function compute_raw_bands(wav, frame_idx, params)
+    local cache_key = string.format(
+        "%s|%d|%d|%d|%d|%.3f|%.4f|%d|%.1f|%.1f|%d|%.2f|%.2f|%.2f",
+        wav.filepath,
+        wav.file_size,
+        frame_idx,
+        params.fft_size,
+        params.window_type,
+        params.fps,
+        params.audio_offset,
+        params.channel_mode,
+        params.min_freq,
+        params.max_freq,
+        params.num_bands,
+        params.freq_scale,
+        params.gain_db,
+        params.floor_db
+    ) .. string.format("|%.2f", params.slope_db)
+
+    local cached = SPECTRUM_FRAME_CACHE[cache_key]
+    if cached then
+        return cached
+    end
+
+    local n = params.fft_size
+    local plan = get_fft_plan(n, params.window_type)
+    local t_sec = (frame_idx / params.fps) + params.audio_offset
+    local center_sample = math.floor(t_sec * wav.sample_rate + 0.5)
+    local start_sample = center_sample - math.floor(n / 2)
+
+    local samples = read_wav_window(wav, start_sample, n, params.channel_mode)
+    local mag, max_bin = compute_fft_magnitudes(samples, plan)
+
+    local sr = wav.sample_rate
+    local nyquist = sr * 0.5
+    local f_min = math.max(10.0, math.min(params.min_freq, nyquist * 0.9))
+    local f_max = math.max(f_min + 10.0, math.min(params.max_freq, nyquist))
+    local num_bands = params.num_bands
+    local floor_db = params.floor_db
+    local db_range = math.max(6.0, -floor_db)
+    local gain_db = params.gain_db
+    local slope_db = params.slope_db
+    local is_log = (params.freq_scale == 0)
+    local freq_ratio = f_max / f_min
+
+    local bands = {}
+    for b = 1, num_bands do
+        local f0, f1
+        if is_log then
+            f0 = f_min * (freq_ratio ^ ((b - 1) / num_bands))
+            f1 = f_min * (freq_ratio ^ (b / num_bands))
+        else
+            f0 = f_min + (f_max - f_min) * ((b - 1) / num_bands)
+            f1 = f_min + (f_max - f_min) * (b / num_bands)
+        end
+
+        local fc = 0.5 * (f0 + f1)
+        local b0 = f0 * n / sr
+        local b1 = f1 * n / sr
+        local amp = 0.0
+
+        if (b1 - b0) < 1.0 then
+            -- Sub-bin interpolation for narrow low-frequency bands
+            local bc = 0.5 * (b0 + b1)
+            local k0 = math.max(0, math.min(max_bin, math.floor(bc)))
+            local k1 = math.max(0, math.min(max_bin, k0 + 1))
+            local frac = bc - k0
+            amp = mag[k0] * (1.0 - frac) + mag[k1] * frac
+        else
+            local k_start = math.max(0, math.floor(b0))
+            local k_end = math.min(max_bin, math.ceil(b1))
+            local sum_sq = 0.0
+            local peak_v = 0.0
+            local count = 0
+            for k = k_start, k_end do
+                local v = mag[k]
+                sum_sq = sum_sq + v * v
+                if v > peak_v then
+                    peak_v = v
+                end
+                count = count + 1
+            end
+            local rms = (count > 0) and math.sqrt(sum_sq / count) or 0.0
+            -- Blend RMS and peak so both broadband noise and pure tones display cleanly
+            amp = 0.65 * rms + 0.35 * peak_v
+        end
+
+        local db = 20.0 * (math.log(math.max(amp, 1e-9)) / LN10)
+        local tilt = slope_db * (math.log(math.max(fc, 20.0) / 1000.0) / LN2)
+        db = db + gain_db + tilt
+
+        local norm_val = (db - floor_db) / db_range
+        if norm_val < 0.0 then norm_val = 0.0 end
+        if norm_val > 1.0 then norm_val = 1.0 end
+        bands[b] = norm_val
+    end
+
+    SPECTRUM_FRAME_CACHE[cache_key] = bands
+    SPECTRUM_CACHE_ORDER[#SPECTRUM_CACHE_ORDER + 1] = cache_key
+    if #SPECTRUM_CACHE_ORDER > MAX_FRAME_CACHE then
+        local old_key = table.remove(SPECTRUM_CACHE_ORDER, 1)
+        SPECTRUM_FRAME_CACHE[old_key] = nil
+    end
+
+    return bands
+end
+
+local function compute_smoothed_spectrum(wav, frame_idx, params)
+    local num_bands = params.num_bands
+    local attack = params.attack
+    local release = params.release
+    local peak_decay = params.peak_decay
+
+    -- Determine deterministic lookback window so scrubbing/random seeks match playback
+    local max_smooth = math.max(attack, release)
+    local lookback = 0
+    if max_smooth > 0.01 or params.peak_hold then
+        lookback = math.min(24, math.max(8, math.floor(1.0 / math.max(0.04, 1.0 - max_smooth) * 2.5)))
+        if params.peak_hold then
+            lookback = math.max(lookback, math.min(36, math.ceil(0.6 / math.max(0.01, peak_decay))))
+        end
+    end
+
+    local start_f = frame_idx - lookback
+    local levels = compute_raw_bands(wav, start_f, params)
+    local cur = {}
+    local peaks = {}
+    for b = 1, num_bands do
+        cur[b] = levels[b]
+        peaks[b] = levels[b]
+    end
+
+    for f = start_f + 1, frame_idx do
+        local raw = compute_raw_bands(wav, f, params)
+        for b = 1, num_bands do
+            local target = raw[b]
+            local prev = cur[b]
+            if target >= prev then
+                cur[b] = prev * attack + target * (1.0 - attack)
+            else
+                cur[b] = prev * release + target * (1.0 - release)
+            end
+
+            local pk = peaks[b] - peak_decay
+            if cur[b] > pk then
+                pk = cur[b]
+            end
+            if pk < 0.0 then pk = 0.0 end
+            peaks[b] = pk
+        end
+    end
+
+    return cur, peaks
+end
+
+--------------------------------------------------------------------------------
+-- Color Helpers
+--------------------------------------------------------------------------------
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+local function hsv_to_rgb(h, s, v)
+    local i = math.floor(h * 6.0)
+    local f = h * 6.0 - i
+    local p = v * (1.0 - s)
+    local q = v * (1.0 - f * s)
+    local t = v * (1.0 - (1.0 - f) * s)
+    local m = i % 6
+    if m == 0 then return v, t, p
+    elseif m == 1 then return q, v, p
+    elseif m == 2 then return p, v, t
+    elseif m == 3 then return p, q, v
+    elseif m == 4 then return t, p, v
+    else return v, p, q
+    end
+end
+
+local function get_band_color(t_freq, color_mode, c1, c2, c3, opacity)
+    local r, g, b, a
+    if color_mode == 0 then
+        r, g, b, a = c1.R, c1.G, c1.B, c1.A
+    elseif color_mode == 1 then
+        if t_freq <= 0.5 then
+            local k = t_freq * 2.0
+            r = lerp(c1.R, c2.R, k)
+            g = lerp(c1.G, c2.G, k)
+            b = lerp(c1.B, c2.B, k)
+            a = lerp(c1.A, c2.A, k)
+        else
+            local k = (t_freq - 0.5) * 2.0
+            r = lerp(c2.R, c3.R, k)
+            g = lerp(c2.G, c3.G, k)
+            b = lerp(c2.B, c3.B, k)
+            a = lerp(c2.A, c3.A, k)
+        end
+    elseif color_mode == 2 then
+        -- Level meter default fallback across bands if used as gradient
+        if t_freq <= 0.6 then
+            local k = t_freq / 0.6
+            r = lerp(0.1, 0.95, k)
+            g = lerp(0.9, 0.85, k)
+            b = lerp(0.35, 0.1, k)
+            a = 1.0
+        else
+            local k = (t_freq - 0.6) / 0.4
+            r = lerp(0.95, 1.0, k)
+            g = lerp(0.85, 0.15, k)
+            b = lerp(0.1, 0.2, k)
+            a = 1.0
+        end
+    else
+        r, g, b = hsv_to_rgb((t_freq * 0.82) % 1.0, 0.88, 1.0)
+        a = 1.0
+    end
+    return r, g, b, a * opacity
+end
+
+--------------------------------------------------------------------------------
+-- Shape Geometry Helpers
+--------------------------------------------------------------------------------
+local function add_rect_to_shape(sh, x0, y0, x1, y1)
+    if x1 <= x0 or y1 <= y0 then
+        return
+    end
+    sh:MoveTo(x0, y0)
+    sh:LineTo(x1, y0)
+    sh:LineTo(x1, y1)
+    sh:LineTo(x0, y1)
+    sh:Close()
+end
+
+local function add_quad_to_shape(sh, x1, y1, x2, y2, x3, y3, x4, y4)
+    sh:MoveTo(x1, y1)
+    sh:LineTo(x2, y2)
+    sh:LineTo(x3, y3)
+    sh:LineTo(x4, y4)
+    sh:Close()
+end
+
+local function draw_shape(img, sh, r, g, b, a, quality)
+    if a <= 0.001 then return end
+    local ic = ImageChannel(img, quality)
+    local fs = FillStyle()
+    local cs = ChannelStyle()
+    ic:SetStyleFill(fs)
+    ic:ShapeFill(sh)
+    cs.Color = Pixel({ R = r, G = g, B = b, A = a })
+    ic:PutToImage("CM_Merge", cs)
+end
+
+-- Catmull-Rom spline interpolation for smooth spectrum curves
+local function sample_catmull_rom(p0, p1, p2, p3, t)
+    local t2 = t * t
+    local t3 = t2 * t
+    return 0.5 * (
+        (2.0 * p1) +
+        (-p0 + p2) * t +
+        (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
+        (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    )
+end
+
+--------------------------------------------------------------------------------
+-- Fusion Tool Definition: Create / OnAddToFlow / NotifyChanged / Process
+--------------------------------------------------------------------------------
+function Create()
+    ----------------------------------------------------------------------------
+    -- Tab 1: Spectrum (Main)
+    ----------------------------------------------------------------------------
+    InAudioFile = self:AddInput("Audio File (WAV)", "AudioFile", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "FileControl",
+        FC_IsSaver = false,
+        FC_ClipBrowse = false,
+        FCS_FilterString = "WAV Audio (*.wav)|*.wav|All Files (*.*)|*.*",
+        INP_External = false,
+    })
+
+    InChannel = self:AddInput("Audio Channel", "AudioChannel", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0,
+        INP_Integer = true,
+        { CCS_AddString = "Mix (L+R)" },
+        { CCS_AddString = "Left" },
+        { CCS_AddString = "Right" },
+    })
+
+    InAutoFPS = self:AddInput("Auto Timeline FPS", "AutoFPS", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 1,
+        INP_Integer = true,
+    })
+
+    InFPS = self:AddInput("Timeline FPS", "TimelineFPS", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 24.0,
+        INP_MinAllowed = 1.0,
+        INP_MaxAllowed = 240.0,
+        INP_MinScale = 15.0,
+        INP_MaxScale = 60.0,
+    })
+
+    InAudioOffset = self:AddInput("Audio Offset (sec)", "AudioOffset", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinAllowed = -3600.0,
+        INP_MaxAllowed = 3600.0,
+        INP_MinScale = -10.0,
+        INP_MaxScale = 10.0,
+    })
+
+    InStyle = self:AddInput("Visual Style", "VisualStyle", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0,
+        INP_Integer = true,
+        { CCS_AddString = "Bars" },
+        { CCS_AddString = "Segmented LED" },
+        { CCS_AddString = "Line Curve" },
+        { CCS_AddString = "Filled Area" },
+        { CCS_AddString = "Circular Bars" },
+        { CCS_AddString = "Circular Line" },
+    })
+
+    InBands = self:AddInput("Bands", "Bands", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 48,
+        INP_Integer = true,
+        INP_MinAllowed = 8,
+        INP_MaxAllowed = 128,
+        INP_MinScale = 8,
+        INP_MaxScale = 96,
+    })
+
+    InMirror = self:AddInput("Mirror Mode", "MirrorMode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 0,
+        INP_Integer = true,
+    })
+
+    InPeakHold = self:AddInput("Peak Hold Caps", "PeakHold", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 1,
+        INP_Integer = true,
+    })
+
+    ----------------------------------------------------------------------------
+    -- Tab 2: Analysis (FFT & Dynamics)
+    ----------------------------------------------------------------------------
+    self:AddControlPage("Analysis")
+
+    InFFTSize = self:AddInput("FFT Size", "FFTSize", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 2,
+        INP_Integer = true,
+        { CCS_AddString = "1024 (Fast)" },
+        { CCS_AddString = "2048 (Balanced)" },
+        { CCS_AddString = "4096 (High Res)" },
+        { CCS_AddString = "8192 (Ultra Bass Res)" },
+    })
+
+    InWindowType = self:AddInput("Window Function", "WindowType", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0,
+        INP_Integer = true,
+        { CCS_AddString = "Hann" },
+        { CCS_AddString = "Hamming" },
+        { CCS_AddString = "Blackman-Harris" },
+    })
+
+    InFreqScale = self:AddInput("Frequency Scale", "FreqScale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0,
+        INP_Integer = true,
+        { CCS_AddString = "Logarithmic" },
+        { CCS_AddString = "Linear" },
+    })
+
+    InMinFreq = self:AddInput("Min Frequency (Hz)", "MinFreq", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 30.0,
+        INP_MinAllowed = 10.0,
+        INP_MaxAllowed = 5000.0,
+        INP_MinScale = 20.0,
+        INP_MaxScale = 500.0,
+    })
+
+    InMaxFreq = self:AddInput("Max Frequency (Hz)", "MaxFreq", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 16000.0,
+        INP_MinAllowed = 500.0,
+        INP_MaxAllowed = 24000.0,
+        INP_MinScale = 2000.0,
+        INP_MaxScale = 22050.0,
+    })
+
+    InGainDB = self:AddInput("Gain (dB)", "GainDB", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinAllowed = -36.0,
+        INP_MaxAllowed = 48.0,
+        INP_MinScale = -24.0,
+        INP_MaxScale = 24.0,
+    })
+
+    InFloorDB = self:AddInput("Noise Floor (dB)", "FloorDB", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = -64.0,
+        INP_MinAllowed = -110.0,
+        INP_MaxAllowed = -12.0,
+        INP_MinScale = -96.0,
+        INP_MaxScale = -24.0,
+    })
+
+    InSlope = self:AddInput("Tilt Slope (dB/oct)", "SlopeDB", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 3.0,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 9.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 6.0,
+    })
+
+    InAttack = self:AddInput("Attack Smoothing", "Attack", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.35,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 0.95,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 0.9,
+    })
+
+    InRelease = self:AddInput("Release Decay", "Release", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.78,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 0.98,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 0.95,
+    })
+
+    InPeakDecay = self:AddInput("Peak Fall Speed", "PeakDecay", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.025,
+        INP_MinAllowed = 0.002,
+        INP_MaxAllowed = 0.25,
+        INP_MinScale = 0.005,
+        INP_MaxScale = 0.1,
+    })
+
+    ----------------------------------------------------------------------------
+    -- Tab 3: Layout
+    ----------------------------------------------------------------------------
+    self:AddControlPage("Layout")
+
+    InCenter = self:AddInput("Center", "Center", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INPID_PreviewControl = "CrosshairControl",
+        INP_DefaultX = 0.5,
+        INP_DefaultY = 0.5,
+    })
+
+    InGraphWidth = self:AddInput("Graph Width", "GraphWidth", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.78,
+        INP_MinAllowed = 0.05,
+        INP_MaxAllowed = 1.0,
+        INP_MinScale = 0.1,
+        INP_MaxScale = 1.0,
+    })
+
+    InGraphHeight = self:AddInput("Graph Height", "GraphHeight", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.45,
+        INP_MinAllowed = 0.05,
+        INP_MaxAllowed = 1.0,
+        INP_MinScale = 0.1,
+        INP_MaxScale = 1.0,
+    })
+
+    InBarGap = self:AddInput("Bar Spacing", "BarGap", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.25,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 0.85,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 0.8,
+    })
+
+    InLineWidth = self:AddInput("Line / Cap Thickness", "LineWidth", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.003,
+        INP_MinAllowed = 0.0005,
+        INP_MaxAllowed = 0.025,
+        INP_MinScale = 0.001,
+        INP_MaxScale = 0.015,
+    })
+
+    InInnerRadius = self:AddInput("Circular Inner Radius", "InnerRadius", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.14,
+        INP_MinAllowed = 0.02,
+        INP_MaxAllowed = 0.45,
+        INP_MinScale = 0.02,
+        INP_MaxScale = 0.35,
+    })
+
+    InRotation = self:AddInput("Circular Rotation (deg)", "Rotation", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinAllowed = -360.0,
+        INP_MaxAllowed = 360.0,
+        INP_MinScale = -180.0,
+        INP_MaxScale = 180.0,
+    })
+
+    InShowGrid = self:AddInput("Show Grid & Baseline", "ShowGrid", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 1,
+        INP_Integer = true,
+    })
+
+    InGridOpacity = self:AddInput("Grid Opacity", "GridOpacity", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.25,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 1.0,
+    })
+
+    InComposite = self:AddInput("Composite Over Input", "CompositeOverInput", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 1,
+        INP_Integer = true,
+    })
+
+    InBgOpacity = self:AddInput("Background Opacity", "BgOpacity", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 1.0,
+    })
+
+    InBgR = self:AddInput("Bg Red", "BgRed", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        ICS_Name = "Background Color",
+        IC_ControlGroup = 10,
+        IC_ControlID = 0,
+        INP_Default = 0.04,
+    })
+    InBgG = self:AddInput("Bg Green", "BgGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 10,
+        IC_ControlID = 1,
+        INP_Default = 0.05,
+    })
+    InBgB = self:AddInput("Bg Blue", "BgBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 10,
+        IC_ControlID = 2,
+        INP_Default = 0.08,
+    })
+    InBgA = self:AddInput("Bg Alpha", "BgAlpha", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 10,
+        IC_ControlID = 3,
+        INP_Default = 1.0,
+    })
+
+    InOutWidth = self:AddInput("Fallback Width", "FallbackWidth", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 1920,
+        INP_Integer = true,
+        INP_MinAllowed = 64,
+        INP_MaxAllowed = 7680,
+        INP_MinScale = 640,
+        INP_MaxScale = 3840,
+    })
+
+    InOutHeight = self:AddInput("Fallback Height", "FallbackHeight", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 1080,
+        INP_Integer = true,
+        INP_MinAllowed = 64,
+        INP_MaxAllowed = 4320,
+        INP_MinScale = 480,
+        INP_MaxScale = 2160,
+    })
+
+    ----------------------------------------------------------------------------
+    -- Tab 4: Color
+    ----------------------------------------------------------------------------
+    self:AddControlPage("Color")
+
+    InColorMode = self:AddInput("Color Mode", "ColorMode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 1,
+        INP_Integer = true,
+        { CCS_AddString = "Solid Color" },
+        { CCS_AddString = "Frequency Gradient" },
+        { CCS_AddString = "Level Meter (G/Y/R)" },
+        { CCS_AddString = "Rainbow" },
+    })
+
+    InColor1R = self:AddInput("Low Red", "LowRed", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        ICS_Name = "Primary / Low Color",
+        IC_ControlGroup = 1,
+        IC_ControlID = 0,
+        INP_Default = 0.0,
+    })
+    InColor1G = self:AddInput("Low Green", "LowGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 1,
+        IC_ControlID = 1,
+        INP_Default = 0.85,
+    })
+    InColor1B = self:AddInput("Low Blue", "LowBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 1,
+        IC_ControlID = 2,
+        INP_Default = 1.0,
+    })
+    InColor1A = self:AddInput("Low Alpha", "LowAlpha", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 1,
+        IC_ControlID = 3,
+        INP_Default = 1.0,
+    })
+
+    InColor2R = self:AddInput("Mid Red", "MidRed", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        ICS_Name = "Mid Color",
+        IC_ControlGroup = 2,
+        IC_ControlID = 0,
+        INP_Default = 0.45,
+    })
+    InColor2G = self:AddInput("Mid Green", "MidGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 2,
+        IC_ControlID = 1,
+        INP_Default = 0.35,
+    })
+    InColor2B = self:AddInput("Mid Blue", "MidBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 2,
+        IC_ControlID = 2,
+        INP_Default = 1.0,
+    })
+    InColor2A = self:AddInput("Mid Alpha", "MidAlpha", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 2,
+        IC_ControlID = 3,
+        INP_Default = 1.0,
+    })
+
+    InColor3R = self:AddInput("High Red", "HighRed", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        ICS_Name = "High / Peak Color",
+        IC_ControlGroup = 3,
+        IC_ControlID = 0,
+        INP_Default = 1.0,
+    })
+    InColor3G = self:AddInput("High Green", "HighGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 3,
+        IC_ControlID = 1,
+        INP_Default = 0.22,
+    })
+    InColor3B = self:AddInput("High Blue", "HighBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 3,
+        IC_ControlID = 2,
+        INP_Default = 0.55,
+    })
+    InColor3A = self:AddInput("High Alpha", "HighAlpha", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 3,
+        IC_ControlID = 3,
+        INP_Default = 1.0,
+    })
+
+    InPeakR = self:AddInput("Peak Red", "PeakRed", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        ICS_Name = "Peak Cap Color",
+        IC_ControlGroup = 4,
+        IC_ControlID = 0,
+        INP_Default = 1.0,
+    })
+    InPeakG = self:AddInput("Peak Green", "PeakGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 4,
+        IC_ControlID = 1,
+        INP_Default = 1.0,
+    })
+    InPeakB = self:AddInput("Peak Blue", "PeakBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 4,
+        IC_ControlID = 2,
+        INP_Default = 1.0,
+    })
+    InPeakA = self:AddInput("Peak Alpha", "PeakAlpha", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 4,
+        IC_ControlID = 3,
+        INP_Default = 1.0,
+    })
+
+    InLedSegments = self:AddInput("LED Segments", "LedSegments", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 18,
+        INP_Integer = true,
+        INP_MinAllowed = 4,
+        INP_MaxAllowed = 48,
+        INP_MinScale = 6,
+        INP_MaxScale = 32,
+    })
+
+    InHaloGlow = self:AddInput("Neon Halo Intensity", "HaloGlow", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.25,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 1.0,
+    })
+
+    InSpectrumOpacity = self:AddInput("Spectrum Opacity", "SpectrumOpacity", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 1.0,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 1.0,
+    })
+
+    ----------------------------------------------------------------------------
+    -- Image Input & Output
+    ----------------------------------------------------------------------------
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+        INP_Required = false,
+    })
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+end
+
+function OnAddToFlow()
+    if self.Comp then
+        local ok, prefs = pcall(function() return self.Comp:GetPrefs("Comp.FrameFormat") end)
+        if ok and prefs and prefs.Rate and prefs.Rate > 0 then
+            InFPS:SetSource(Number(prefs.Rate), 0)
+        end
+    end
+end
+
+function NotifyChanged(inp, param, time)
+end
+
+--------------------------------------------------------------------------------
+-- Rendering Functions
+--------------------------------------------------------------------------------
+local function render_grid(out, aspect, style, cx, cy, x0, x1, y_bottom, y_top, y_base, gw, gh, mirror, inner_r, grid_opacity, quality)
+    if grid_opacity <= 0.001 then
+        return
+    end
+    local grid_shape = Shape()
+    local stroke_w = 0.0012
+
+    if style == 4 or style == 5 then
+        local max_r = gh * 0.5
+        local rings = { inner_r, inner_r + max_r * 0.5, inner_r + max_r }
+        local segs = 72
+        for _, r in ipairs(rings) do
+            for s = 0, segs do
+                local ang = (s / segs) * TWO_PI
+                local px = cx + r * math.cos(ang)
+                local py = cy + r * math.sin(ang)
+                if s == 0 then
+                    grid_shape:MoveTo(px, py)
+                else
+                    grid_shape:LineTo(px, py)
+                end
+            end
+        end
+    else
+        -- Horizontal dB guide lines (0%, 25%, 50%, 75%, 100%)
+        local divs = 4
+        for i = 0, divs do
+            local gy = y_bottom + (gh * i / divs)
+            grid_shape:MoveTo(x0, gy)
+            grid_shape:LineTo(x1, gy)
+        end
+        -- Vertical octave guide lines
+        local vdivs = 8
+        for i = 0, vdivs do
+            local gx = x0 + (gw * i / vdivs)
+            grid_shape:MoveTo(gx, y_bottom)
+            grid_shape:LineTo(gx, y_top)
+        end
+        if mirror then
+            grid_shape:MoveTo(x0, y_base)
+            grid_shape:LineTo(x1, y_base)
+        end
+    end
+
+    local outlined = grid_shape:OutlineOfShape(stroke_w, "OLT_Solid")
+    draw_shape(out, outlined, 0.85, 0.9, 1.0, grid_opacity * 0.65, quality)
+end
+
+local function render_spectrum(out, levels, peaks, opts)
+    local aspect = (out.Height * out.YScale) / (out.Width * out.XScale)
+    local quality = opts.quick and 4 or 8
+
+    local cx = opts.center_x
+    local cy = opts.center_y * aspect
+    local gw = opts.graph_w
+    local gh = opts.graph_h * aspect
+    local x0 = cx - gw * 0.5
+    local x1 = cx + gw * 0.5
+    local y_bottom = cy - gh * 0.5
+    local y_top = cy + gh * 0.5
+    local mirror = opts.mirror
+    local y_base = mirror and cy or y_bottom
+    local max_h = mirror and (gh * 0.5) or gh
+
+    -- Optional tinted backdrop
+    if opts.bg_opacity > 0.001 then
+        local bg_shape = Shape()
+        add_rect_to_shape(bg_shape, -0.01, -0.01, 1.01, aspect + 0.01)
+        draw_shape(out, bg_shape, opts.bg.R, opts.bg.G, opts.bg.B, opts.bg.A * opts.bg_opacity, 4)
+    end
+
+    -- Optional Grid & Baseline
+    if opts.show_grid then
+        render_grid(out, aspect, opts.style, cx, cy, x0, x1, y_bottom, y_top, y_base, gw, gh, mirror, opts.inner_r, opts.grid_opacity, quality)
+    end
+
+    local num_bands = #levels
+    local style = opts.style
+    local color_mode = opts.color_mode
+    local c1, c2, c3, c_peak = opts.c1, opts.c2, opts.c3, opts.c_peak
+    local opacity = opts.opacity
+    local halo = opts.halo
+    local gap = opts.bar_gap
+    local line_w = opts.line_w
+
+    ----------------------------------------------------------------------------
+    -- Style 0: Bars
+    ----------------------------------------------------------------------------
+    if style == 0 then
+        local slot_w = gw / num_bands
+        local bar_w = math.max(0.0008, slot_w * (1.0 - gap))
+        local min_h = 0.0015 * aspect
+
+        if color_mode == 0 then
+            local sh = Shape()
+            local halo_sh = (halo > 0.01) and Shape() or nil
+            for i = 1, num_bands do
+                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
+                local bx1 = bx0 + bar_w
+                local bh = math.max(levels[i] * max_h, min_h)
+                if mirror then
+                    add_rect_to_shape(sh, bx0, cy - bh, bx1, cy + bh)
+                    if halo_sh then
+                        local pad = bar_w * 0.35
+                        add_rect_to_shape(halo_sh, bx0 - pad, cy - bh - pad, bx1 + pad, cy + bh + pad)
+                    end
+                else
+                    add_rect_to_shape(sh, bx0, y_bottom, bx1, y_bottom + bh)
+                    if halo_sh then
+                        local pad = bar_w * 0.35
+                        add_rect_to_shape(halo_sh, bx0 - pad, y_bottom, bx1 + pad, y_bottom + bh + pad)
+                    end
+                end
+            end
+            if halo_sh then
+                draw_shape(out, halo_sh, c1.R, c1.G, c1.B, c1.A * opacity * 0.22 * halo, quality)
+            end
+            draw_shape(out, sh, c1.R, c1.G, c1.B, c1.A * opacity, quality)
+        else
+            -- Bucket colors into <= 24 passes for speed + smooth gradients
+            local buckets = math.min(num_bands, 24)
+            local bucket_shapes = {}
+            local halo_shapes = (halo > 0.01) and {} or nil
+            for k = 1, buckets do
+                bucket_shapes[k] = Shape()
+                if halo_shapes then halo_shapes[k] = Shape() end
+            end
+
+            for i = 1, num_bands do
+                local t_freq = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.0
+                local t_color = (color_mode == 2) and levels[i] or t_freq
+                local b_idx = math.max(1, math.min(buckets, math.floor(t_color * (buckets - 1) + 0.5) + 1))
+
+                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
+                local bx1 = bx0 + bar_w
+                local bh = math.max(levels[i] * max_h, min_h)
+                if mirror then
+                    add_rect_to_shape(bucket_shapes[b_idx], bx0, cy - bh, bx1, cy + bh)
+                    if halo_shapes then
+                        local pad = bar_w * 0.35
+                        add_rect_to_shape(halo_shapes[b_idx], bx0 - pad, cy - bh - pad, bx1 + pad, cy + bh + pad)
+                    end
+                else
+                    add_rect_to_shape(bucket_shapes[b_idx], bx0, y_bottom, bx1, y_bottom + bh)
+                    if halo_shapes then
+                        local pad = bar_w * 0.35
+                        add_rect_to_shape(halo_shapes[b_idx], bx0 - pad, y_bottom, bx1 + pad, y_bottom + bh + pad)
+                    end
+                end
+            end
+
+            for k = 1, buckets do
+                local tk = (buckets > 1) and ((k - 1) / (buckets - 1)) or 0.0
+                local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity)
+                if halo_shapes then
+                    draw_shape(out, halo_shapes[k], r, g, b, a * 0.22 * halo, quality)
+                end
+                draw_shape(out, bucket_shapes[k], r, g, b, a, quality)
+            end
+        end
+
+        if opts.peak_hold then
+            local psh = Shape()
+            local cap_h = math.max(line_w, 0.002 * aspect)
+            for i = 1, num_bands do
+                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
+                local bx1 = bx0 + bar_w
+                local ph = peaks[i] * max_h
+                if mirror then
+                    add_rect_to_shape(psh, bx0, cy + ph, bx1, cy + ph + cap_h)
+                    add_rect_to_shape(psh, bx0, cy - ph - cap_h, bx1, cy - ph)
+                else
+                    add_rect_to_shape(psh, bx0, y_bottom + ph, bx1, y_bottom + ph + cap_h)
+                end
+            end
+            draw_shape(out, psh, c_peak.R, c_peak.G, c_peak.B, c_peak.A * opacity, quality)
+        end
+
+    ----------------------------------------------------------------------------
+    -- Style 1: Segmented LED
+    ----------------------------------------------------------------------------
+    elseif style == 1 then
+        local slot_w = gw / num_bands
+        local bar_w = math.max(0.0008, slot_w * (1.0 - gap))
+        local n_segs = opts.led_segments
+        local seg_slot = max_h / n_segs
+        local seg_h = seg_slot * 0.72
+
+        if color_mode == 2 then
+            -- Classic 3-zone LED Meter: Green -> Yellow -> Red
+            local sh_low = Shape()
+            local sh_mid = Shape()
+            local sh_high = Shape()
+            for i = 1, num_bands do
+                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
+                local bx1 = bx0 + bar_w
+                local lit = math.floor(levels[i] * n_segs + 0.5)
+                for s = 1, lit do
+                    local frac = s / n_segs
+                    local target = (frac <= 0.60) and sh_low or ((frac <= 0.84) and sh_mid or sh_high)
+                    local sy0 = (s - 1) * seg_slot
+                    local sy1 = sy0 + seg_h
+                    if mirror then
+                        add_rect_to_shape(target, bx0, cy + sy0, bx1, cy + sy1)
+                        add_rect_to_shape(target, bx0, cy - sy1, bx1, cy - sy0)
+                    else
+                        add_rect_to_shape(target, bx0, y_bottom + sy0, bx1, y_bottom + sy1)
+                    end
+                end
+            end
+            draw_shape(out, sh_low, 0.12, 0.92, 0.42, opacity, quality)
+            draw_shape(out, sh_mid, 1.00, 0.82, 0.12, opacity, quality)
+            draw_shape(out, sh_high, 1.00, 0.18, 0.25, opacity, quality)
+        else
+            local buckets = math.min(num_bands, 24)
+            local bucket_shapes = {}
+            for k = 1, buckets do bucket_shapes[k] = Shape() end
+
+            for i = 1, num_bands do
+                local t_freq = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.0
+                local b_idx = (color_mode == 0) and 1 or math.max(1, math.min(buckets, math.floor(t_freq * (buckets - 1) + 0.5) + 1))
+                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
+                local bx1 = bx0 + bar_w
+                local lit = math.floor(levels[i] * n_segs + 0.5)
+                for s = 1, lit do
+                    local sy0 = (s - 1) * seg_slot
+                    local sy1 = sy0 + seg_h
+                    if mirror then
+                        add_rect_to_shape(bucket_shapes[b_idx], bx0, cy + sy0, bx1, cy + sy1)
+                        add_rect_to_shape(bucket_shapes[b_idx], bx0, cy - sy1, bx1, cy - sy0)
+                    else
+                        add_rect_to_shape(bucket_shapes[b_idx], bx0, y_bottom + sy0, bx1, y_bottom + sy1)
+                    end
+                end
+            end
+            for k = 1, (color_mode == 0 and 1 or buckets) do
+                local tk = (buckets > 1) and ((k - 1) / (buckets - 1)) or 0.0
+                local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity)
+                draw_shape(out, bucket_shapes[k], r, g, b, a, quality)
+            end
+        end
+
+        if opts.peak_hold then
+            local psh = Shape()
+            for i = 1, num_bands do
+                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
+                local bx1 = bx0 + bar_w
+                local pk_seg = math.max(1, math.min(n_segs, math.floor(peaks[i] * n_segs + 0.5)))
+                if peaks[i] > 0.005 then
+                    local sy0 = (pk_seg - 1) * seg_slot
+                    local sy1 = sy0 + seg_h
+                    if mirror then
+                        add_rect_to_shape(psh, bx0, cy + sy0, bx1, cy + sy1)
+                        add_rect_to_shape(psh, bx0, cy - sy1, bx1, cy - sy0)
+                    else
+                        add_rect_to_shape(psh, bx0, y_bottom + sy0, bx1, y_bottom + sy1)
+                    end
+                end
+            end
+            draw_shape(out, psh, c_peak.R, c_peak.G, c_peak.B, c_peak.A * opacity, quality)
+        end
+
+    ----------------------------------------------------------------------------
+    -- Style 2 (Line Curve) & Style 3 (Filled Area)
+    ----------------------------------------------------------------------------
+    elseif style == 2 or style == 3 then
+        local pts_x = {}
+        local pts_y = {}
+        for i = 1, num_bands do
+            local tx = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.5
+            pts_x[i] = x0 + tx * gw
+            pts_y[i] = levels[i] * max_h
+        end
+
+        local subdiv = 3
+        local smooth_x = {}
+        local smooth_y = {}
+        for i = 1, num_bands - 1 do
+            local p0 = pts_y[math.max(1, i - 1)]
+            local p1 = pts_y[i]
+            local p2 = pts_y[i + 1]
+            local p3 = pts_y[math.min(num_bands, i + 2)]
+            for s = 0, subdiv - 1 do
+                local t = s / subdiv
+                smooth_x[#smooth_x + 1] = lerp(pts_x[i], pts_x[i + 1], t)
+                local sy = sample_catmull_rom(p0, p1, p2, p3, t)
+                if sy < 0.0 then sy = 0.0 end
+                if sy > max_h then sy = max_h end
+                smooth_y[#smooth_y + 1] = sy
+            end
+        end
+        smooth_x[#smooth_x + 1] = pts_x[num_bands]
+        smooth_y[#smooth_y + 1] = pts_y[num_bands]
+
+        if color_mode == 0 then
+            local r_main, g_main, b_main, a_main = c1.R, c1.G, c1.B, c1.A * opacity
+            if style == 3 then
+                local fill_sh = Shape()
+                fill_sh:MoveTo(smooth_x[1], y_base)
+                for k = 1, #smooth_x do
+                    fill_sh:LineTo(smooth_x[k], y_base + smooth_y[k])
+                end
+                fill_sh:LineTo(smooth_x[#smooth_x], y_base)
+                fill_sh:Close()
+
+                if mirror then
+                    fill_sh:MoveTo(smooth_x[1], y_base)
+                    for k = 1, #smooth_x do
+                        fill_sh:LineTo(smooth_x[k], y_base - smooth_y[k])
+                    end
+                    fill_sh:LineTo(smooth_x[#smooth_x], y_base)
+                    fill_sh:Close()
+                end
+                draw_shape(out, fill_sh, r_main, g_main, b_main, a_main * 0.42, quality)
+            end
+
+            local line_sh = Shape()
+            line_sh:MoveTo(smooth_x[1], y_base + smooth_y[1])
+            for k = 2, #smooth_x do
+                line_sh:LineTo(smooth_x[k], y_base + smooth_y[k])
+            end
+            if mirror then
+                line_sh:MoveTo(smooth_x[1], y_base - smooth_y[1])
+                for k = 2, #smooth_x do
+                    line_sh:LineTo(smooth_x[k], y_base - smooth_y[k])
+                end
+            end
+
+            if halo > 0.01 then
+                local halo_out = line_sh:OutlineOfShape(line_w * 3.2, "OLT_Solid")
+                draw_shape(out, halo_out, r_main, g_main, b_main, a_main * 0.25 * halo, quality)
+            end
+            local line_out = line_sh:OutlineOfShape(line_w, "OLT_Solid")
+            draw_shape(out, line_out, c_peak.R * 0.3 + r_main * 0.7, c_peak.G * 0.3 + g_main * 0.7, c_peak.B * 0.3 + b_main * 0.7, a_main, quality)
+        else
+            local total_pts = #smooth_x
+            local buckets = math.min(num_bands, 24)
+            for b = 1, buckets do
+                local i_start = math.max(1, math.floor(((b - 1) / buckets) * (total_pts - 1)) + 1)
+                local i_end = math.min(total_pts, math.floor((b / buckets) * (total_pts - 1)) + 1)
+                if i_end > i_start then
+                    local mid_k = math.floor((i_start + i_end) * 0.5)
+                    local t_freq = (total_pts > 1) and ((mid_k - 1) / (total_pts - 1)) or 0.0
+                    local t_color = (color_mode == 2 and max_h > 0) and (smooth_y[mid_k] / max_h) or t_freq
+                    local r_b, g_b, b_b, a_b = get_band_color(t_color, color_mode, c1, c2, c3, opacity)
+
+                    if style == 3 then
+                        local fill_sh = Shape()
+                        fill_sh:MoveTo(smooth_x[i_start], y_base)
+                        for k = i_start, i_end do
+                            fill_sh:LineTo(smooth_x[k], y_base + smooth_y[k])
+                        end
+                        fill_sh:LineTo(smooth_x[i_end], y_base)
+                        fill_sh:Close()
+
+                        if mirror then
+                            fill_sh:MoveTo(smooth_x[i_start], y_base)
+                            for k = i_start, i_end do
+                                fill_sh:LineTo(smooth_x[k], y_base - smooth_y[k])
+                            end
+                            fill_sh:LineTo(smooth_x[i_end], y_base)
+                            fill_sh:Close()
+                        end
+                        draw_shape(out, fill_sh, r_b, g_b, b_b, a_b * 0.42, quality)
+                    end
+
+                    local seg_sh = Shape()
+                    seg_sh:MoveTo(smooth_x[i_start], y_base + smooth_y[i_start])
+                    for k = i_start + 1, i_end do
+                        seg_sh:LineTo(smooth_x[k], y_base + smooth_y[k])
+                    end
+                    if mirror then
+                        seg_sh:MoveTo(smooth_x[i_start], y_base - smooth_y[i_start])
+                        for k = i_start + 1, i_end do
+                            seg_sh:LineTo(smooth_x[k], y_base - smooth_y[k])
+                        end
+                    end
+                    if halo > 0.01 then
+                        draw_shape(out, seg_sh:OutlineOfShape(line_w * 3.2, "OLT_Solid"), r_b, g_b, b_b, a_b * 0.25 * halo, quality)
+                    end
+                    draw_shape(out, seg_sh:OutlineOfShape(line_w, "OLT_Solid"), c_peak.R * 0.25 + r_b * 0.75, c_peak.G * 0.25 + g_b * 0.75, c_peak.B * 0.25 + b_b * 0.75, a_b, quality)
+                end
+            end
+        end
+
+    ----------------------------------------------------------------------------
+    -- Style 4: Circular Bars
+    ----------------------------------------------------------------------------
+    elseif style == 4 then
+        local rot_rad = (opts.rotation * math.pi) / 180.0
+        local base_r = opts.inner_r
+        local max_r = gh * 0.5
+        local angular_slot = TWO_PI / num_bands
+        local half_ang = angular_slot * (1.0 - gap) * 0.5
+        local buckets = (color_mode == 0) and 1 or math.min(num_bands, 24)
+        local bucket_shapes = {}
+        local halo_shapes = (halo > 0.01) and {} or nil
+        for k = 1, buckets do
+            bucket_shapes[k] = Shape()
+            if halo_shapes then halo_shapes[k] = Shape() end
+        end
+
+        for i = 1, num_bands do
+            local t_freq = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.0
+            local t_color = (color_mode == 2) and levels[i] or t_freq
+            local b_idx = (color_mode == 0) and 1 or math.max(1, math.min(buckets, math.floor(t_color * (buckets - 1) + 0.5) + 1))
+
+            local theta = rot_rad + (i - 1) * angular_slot
+            local a0 = theta - half_ang
+            local a1 = theta + half_ang
+            local c0, s0 = math.cos(a0), math.sin(a0)
+            local c1a, s1a = math.cos(a1), math.sin(a1)
+
+            local r_out = base_r + math.max(levels[i] * max_r, 0.002)
+            local r_in = mirror and math.max(0.005, base_r - levels[i] * max_r * 0.45) or base_r
+
+            add_quad_to_shape(
+                bucket_shapes[b_idx],
+                cx + r_in * c0, cy + r_in * s0,
+                cx + r_out * c0, cy + r_out * s0,
+                cx + r_out * c1a, cy + r_out * s1a,
+                cx + r_in * c1a, cy + r_in * s1a
+            )
+
+            if halo_shapes then
+                local pad = half_ang * 0.35
+                local hc0, hs0 = math.cos(a0 - pad), math.sin(a0 - pad)
+                local hc1, hs1 = math.cos(a1 + pad), math.sin(a1 + pad)
+                add_quad_to_shape(
+                    halo_shapes[b_idx],
+                    cx + r_in * hc0, cy + r_in * hs0,
+                    cx + (r_out + 0.006) * hc0, cy + (r_out + 0.006) * hs0,
+                    cx + (r_out + 0.006) * hc1, cy + (r_out + 0.006) * hs1,
+                    cx + r_in * hc1, cy + r_in * hs1
+                )
+            end
+        end
+
+        for k = 1, buckets do
+            local tk = (buckets > 1) and ((k - 1) / (buckets - 1)) or 0.0
+            local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity)
+            if halo_shapes then
+                draw_shape(out, halo_shapes[k], r, g, b, a * 0.22 * halo, quality)
+            end
+            draw_shape(out, bucket_shapes[k], r, g, b, a, quality)
+        end
+
+        if opts.peak_hold then
+            local psh = Shape()
+            local cap_r = math.max(line_w, 0.0025)
+            for i = 1, num_bands do
+                local theta = rot_rad + (i - 1) * angular_slot
+                local a0 = theta - half_ang
+                local a1 = theta + half_ang
+                local rp0 = base_r + peaks[i] * max_r
+                local rp1 = rp0 + cap_r
+                add_quad_to_shape(
+                    psh,
+                    cx + rp0 * math.cos(a0), cy + rp0 * math.sin(a0),
+                    cx + rp1 * math.cos(a0), cy + rp1 * math.sin(a0),
+                    cx + rp1 * math.cos(a1), cy + rp1 * math.sin(a1),
+                    cx + rp0 * math.cos(a1), cy + rp0 * math.sin(a1)
+                )
+            end
+            draw_shape(out, psh, c_peak.R, c_peak.G, c_peak.B, c_peak.A * opacity, quality)
+        end
+
+    ----------------------------------------------------------------------------
+    -- Style 5: Circular Line
+    ----------------------------------------------------------------------------
+    elseif style == 5 then
+        local rot_rad = (opts.rotation * math.pi) / 180.0
+        local base_r = opts.inner_r
+        local max_r = gh * 0.5
+        local angular_slot = TWO_PI / num_bands
+        local subdiv = 3
+
+        local outer_x = {}
+        local outer_y = {}
+        local outer_val = {}
+        local inner_x = mirror and {} or nil
+        local inner_y = mirror and {} or nil
+
+        for i = 1, num_bands do
+            local i0 = ((i - 2) % num_bands) + 1
+            local i1 = i
+            local i2 = (i % num_bands) + 1
+            local i3 = ((i + 1) % num_bands) + 1
+            local base_ang = rot_rad + (i - 1) * angular_slot
+
+            for s = 0, subdiv - 1 do
+                local t = s / subdiv
+                local val = sample_catmull_rom(levels[i0], levels[i1], levels[i2], levels[i3], t)
+                if val < 0.0 then val = 0.0 end
+                if val > 1.0 then val = 1.0 end
+                local ang = base_ang + t * angular_slot
+                local ca, sa = math.cos(ang), math.sin(ang)
+
+                local r_out = base_r + val * max_r
+                outer_x[#outer_x + 1] = cx + r_out * ca
+                outer_y[#outer_y + 1] = cy + r_out * sa
+                outer_val[#outer_val + 1] = val
+
+                if inner_x then
+                    local r_in = math.max(0.005, base_r - val * max_r * 0.45)
+                    inner_x[#inner_x + 1] = cx + r_in * ca
+                    inner_y[#inner_y + 1] = cy + r_in * sa
+                end
+            end
+        end
+
+        local outer_sh = Shape()
+        outer_sh:MoveTo(outer_x[1], outer_y[1])
+        for k = 2, #outer_x do
+            outer_sh:LineTo(outer_x[k], outer_y[k])
+        end
+        outer_sh:LineTo(outer_x[1], outer_y[1])
+        outer_sh:Close()
+
+        local r_main, g_main, b_main, a_main
+        if color_mode == 0 then
+            r_main, g_main, b_main, a_main = c1.R, c1.G, c1.B, c1.A * opacity
+        else
+            r_main, g_main, b_main, a_main = get_band_color(0.35, 1, c1, c2, c3, opacity)
+        end
+
+        -- Subtle inner glow fill
+        draw_shape(out, outer_sh, r_main, g_main, b_main, a_main * 0.16, quality)
+
+        if color_mode == 0 then
+            if halo > 0.01 then
+                draw_shape(out, outer_sh:OutlineOfShape(line_w * 3.0, "OLT_Solid"), r_main, g_main, b_main, a_main * 0.25 * halo, quality)
+            end
+            draw_shape(out, outer_sh:OutlineOfShape(line_w, "OLT_Solid"), r_main, g_main, b_main, a_main, quality)
+        else
+            local total_pts = #outer_x
+            local buckets = math.min(num_bands, 24)
+            for b = 1, buckets do
+                local i_start = math.max(1, math.floor(((b - 1) / buckets) * total_pts) + 1)
+                local i_end = math.min(total_pts + 1, math.floor((b / buckets) * total_pts) + 1)
+                if i_end > i_start then
+                    local mid_k = math.min(total_pts, math.floor((i_start + i_end) * 0.5))
+                    local t_freq = (total_pts > 1) and ((mid_k - 1) / total_pts) or 0.0
+                    local t_color = (color_mode == 2) and outer_val[mid_k] or t_freq
+                    local r_b, g_b, b_b, a_b = get_band_color(t_color, color_mode, c1, c2, c3, opacity)
+
+                    local seg_sh = Shape()
+                    seg_sh:MoveTo(outer_x[i_start], outer_y[i_start])
+                    for k = i_start + 1, i_end do
+                        local kk = ((k - 1) % total_pts) + 1
+                        seg_sh:LineTo(outer_x[kk], outer_y[kk])
+                    end
+                    if halo > 0.01 then
+                        draw_shape(out, seg_sh:OutlineOfShape(line_w * 3.0, "OLT_Solid"), r_b, g_b, b_b, a_b * 0.25 * halo, quality)
+                    end
+                    draw_shape(out, seg_sh:OutlineOfShape(line_w, "OLT_Solid"), r_b, g_b, b_b, a_b, quality)
+                end
+            end
+        end
+
+        if inner_x then
+            local inner_sh = Shape()
+            inner_sh:MoveTo(inner_x[1], inner_y[1])
+            for k = 2, #inner_x do
+                inner_sh:LineTo(inner_x[k], inner_y[k])
+            end
+            inner_sh:LineTo(inner_x[1], inner_y[1])
+            inner_sh:Close()
+            draw_shape(out, inner_sh:OutlineOfShape(line_w, "OLT_Solid"), c2.R, c2.G, c2.B, a_main * 0.85, quality)
+        end
+    end
+end
+
+function Process(req)
+    local in_img = InImage:GetValue(req)
+    local out_w, out_h, xscale, yscale
+    local prefs = nil
+    if self.Comp then
+        local ok, res = pcall(function() return self.Comp:GetPrefs("Comp.FrameFormat") end)
+        if ok then prefs = res end
+    end
+
+    if in_img then
+        out_w = in_img.Width
+        out_h = in_img.Height
+        xscale = in_img.XScale
+        yscale = in_img.YScale
+    else
+        local fb_w = math.floor(InOutWidth:GetValue(req).Value + 0.5)
+        local fb_h = math.floor(InOutHeight:GetValue(req).Value + 0.5)
+        out_w = (prefs and prefs.Width) or fb_w
+        out_h = (prefs and prefs.Height) or fb_h
+        xscale = (prefs and prefs.XAspect) or 1.0
+        yscale = (prefs and prefs.YAspect) or 1.0
+        if req:IsQuick() then
+            out_w = math.max(64, math.floor(out_w * 0.5))
+            out_h = math.max(64, math.floor(out_h * 0.5))
+        end
+    end
+
+    if req:IsPreCalc() then
+        local pre_out = Image({
+            IMG_Document = self.Comp,
+            IMG_Width = out_w,
+            IMG_Height = out_h,
+            IMG_XScale = xscale,
+            IMG_YScale = yscale,
+            IMG_NoData = true,
+        })
+        OutImage:Set(req, pre_out)
+        return
+    end
+
+    local composite = (InComposite:GetValue(req).Value > 0.5)
+    local out
+    if in_img and composite then
+        out = in_img:CopyOf()
+    elseif in_img then
+        out = Image({ IMG_Like = in_img })
+        out:Fill(Pixel({ R = 0, G = 0, B = 0, A = 0 }))
+    else
+        out = Image({
+            IMG_Document = self.Comp,
+            IMG_Width = out_w,
+            IMG_Height = out_h,
+            IMG_XScale = xscale,
+            IMG_YScale = yscale,
+            { IMG_Channel = "Red" },
+            { IMG_Channel = "Green" },
+            { IMG_Channel = "Blue" },
+            { IMG_Channel = "Alpha" },
+        })
+        out:Fill(Pixel({ R = 0, G = 0, B = 0, A = 0 }))
+    end
+
+    local filepath = InAudioFile:GetValue(req).Value
+    local num_bands = math.max(8, math.min(128, math.floor(InBands:GetValue(req).Value + 0.5)))
+    local fft_idx = math.floor(InFFTSize:GetValue(req).Value + 0.5)
+    local fft_sizes = { [0] = 1024, [1] = 2048, [2] = 4096, [3] = 8192 }
+    local fft_size = fft_sizes[fft_idx] or 4096
+
+    local auto_fps = (InAutoFPS:GetValue(req).Value > 0.5)
+    local manual_fps = InFPS:GetValue(req).Value
+    local eff_fps = (auto_fps and prefs and prefs.Rate and prefs.Rate > 0) and prefs.Rate or manual_fps
+
+    local peak_hold = (InPeakHold:GetValue(req).Value > 0.5)
+    local params = {
+        fft_size = fft_size,
+        window_type = math.floor(InWindowType:GetValue(req).Value + 0.5),
+        freq_scale = math.floor(InFreqScale:GetValue(req).Value + 0.5),
+        fps = math.max(1.0, eff_fps),
+        audio_offset = InAudioOffset:GetValue(req).Value,
+        channel_mode = math.floor(InChannel:GetValue(req).Value + 0.5),
+        min_freq = InMinFreq:GetValue(req).Value,
+        max_freq = InMaxFreq:GetValue(req).Value,
+        num_bands = num_bands,
+        gain_db = InGainDB:GetValue(req).Value,
+        floor_db = InFloorDB:GetValue(req).Value,
+        slope_db = InSlope:GetValue(req).Value,
+        attack = InAttack:GetValue(req).Value,
+        release = InRelease:GetValue(req).Value,
+        peak_decay = InPeakDecay:GetValue(req).Value,
+        peak_hold = peak_hold,
+    }
+
+    local levels = {}
+    local peaks = {}
+    for b = 1, num_bands do
+        levels[b] = 0.0
+        peaks[b] = 0.0
+    end
+
+    local wav, wav_err = parse_wav_header(filepath)
+    if wav then
+        levels, peaks = compute_smoothed_spectrum(wav, math.floor(req.Time + 0.5), params)
+    elseif filepath and filepath ~= "" and wav_err then
+        -- Non-fatal log so user can diagnose path/format in Fusion Console
+        print("[AudioSpectrumAnalyzer] " .. tostring(wav_err) .. " (" .. tostring(filepath) .. ")")
+    end
+
+    local center = InCenter:GetValue(req)
+    local opts = {
+        quick = req:IsQuick(),
+        style = math.floor(InStyle:GetValue(req).Value + 0.5),
+        mirror = (InMirror:GetValue(req).Value > 0.5),
+        peak_hold = peak_hold,
+        center_x = center.X,
+        center_y = center.Y,
+        graph_w = InGraphWidth:GetValue(req).Value,
+        graph_h = InGraphHeight:GetValue(req).Value,
+        bar_gap = InBarGap:GetValue(req).Value,
+        line_w = InLineWidth:GetValue(req).Value,
+        inner_r = InInnerRadius:GetValue(req).Value,
+        rotation = InRotation:GetValue(req).Value,
+        show_grid = (InShowGrid:GetValue(req).Value > 0.5),
+        grid_opacity = InGridOpacity:GetValue(req).Value,
+        bg_opacity = InBgOpacity:GetValue(req).Value,
+        bg = {
+            R = InBgR:GetValue(req).Value,
+            G = InBgG:GetValue(req).Value,
+            B = InBgB:GetValue(req).Value,
+            A = InBgA:GetValue(req).Value,
+        },
+        color_mode = math.floor(InColorMode:GetValue(req).Value + 0.5),
+        c1 = {
+            R = InColor1R:GetValue(req).Value,
+            G = InColor1G:GetValue(req).Value,
+            B = InColor1B:GetValue(req).Value,
+            A = InColor1A:GetValue(req).Value,
+        },
+        c2 = {
+            R = InColor2R:GetValue(req).Value,
+            G = InColor2G:GetValue(req).Value,
+            B = InColor2B:GetValue(req).Value,
+            A = InColor2A:GetValue(req).Value,
+        },
+        c3 = {
+            R = InColor3R:GetValue(req).Value,
+            G = InColor3G:GetValue(req).Value,
+            B = InColor3B:GetValue(req).Value,
+            A = InColor3A:GetValue(req).Value,
+        },
+        c_peak = {
+            R = InPeakR:GetValue(req).Value,
+            G = InPeakG:GetValue(req).Value,
+            B = InPeakB:GetValue(req).Value,
+            A = InPeakA:GetValue(req).Value,
+        },
+        led_segments = math.max(4, math.min(48, math.floor(InLedSegments:GetValue(req).Value + 0.5))),
+        halo = InHaloGlow:GetValue(req).Value,
+        opacity = InSpectrumOpacity:GetValue(req).Value,
+    }
+
+    render_spectrum(out, levels, peaks, opts)
+    OutImage:Set(req, out)
+end

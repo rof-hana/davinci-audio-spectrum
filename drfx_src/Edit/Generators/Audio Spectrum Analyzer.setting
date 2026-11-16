@@ -1,0 +1,343 @@
+{
+	Tools = ordered() {
+		["Audio Spectrum Analyzer"] = MacroOperator {
+			CtrlWZoom = false,
+			Inputs = ordered() {
+				InputAudioFile = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "AudioFile",
+					Page = "Spectrum",
+				},
+				InputAudioChannel = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "AudioChannel",
+					Default = 0,
+				},
+				InputAutoFPS = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "AutoFPS",
+					Default = 1,
+				},
+				InputTimelineFPS = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "TimelineFPS",
+					Default = 24,
+				},
+				InputAudioOffset = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "AudioOffset",
+					Default = 0,
+				},
+				InputVisualStyle = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "VisualStyle",
+					Default = 0,
+				},
+				InputBands = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "Bands",
+					Default = 48,
+				},
+				InputMirrorMode = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "MirrorMode",
+					Default = 0,
+				},
+				InputPeakHold = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "PeakHold",
+					Default = 1,
+				},
+
+				InputFFTSize = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "FFTSize",
+					Page = "Analysis",
+					Default = 2,
+				},
+				InputWindowType = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "WindowType",
+					Default = 0,
+				},
+				InputFreqScale = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "FreqScale",
+					Default = 0,
+				},
+				InputMinFreq = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "MinFreq",
+					Default = 30,
+				},
+				InputMaxFreq = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "MaxFreq",
+					Default = 16000,
+				},
+				InputGainDB = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "GainDB",
+					Default = 0,
+				},
+				InputFloorDB = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "FloorDB",
+					Default = -64,
+				},
+				InputSlopeDB = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "SlopeDB",
+					Default = 3,
+				},
+				InputAttack = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "Attack",
+					Default = 0.35,
+				},
+				InputRelease = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "Release",
+					Default = 0.78,
+				},
+				InputPeakDecay = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "PeakDecay",
+					Default = 0.025,
+				},
+
+				InputCenter = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "Center",
+					Page = "Layout",
+					DefaultX = 0.5,
+					DefaultY = 0.5,
+				},
+				InputGraphWidth = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "GraphWidth",
+					Default = 0.78,
+				},
+				InputGraphHeight = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "GraphHeight",
+					Default = 0.45,
+				},
+				InputBarGap = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "BarGap",
+					Default = 0.25,
+				},
+				InputLineWidth = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "LineWidth",
+					Default = 0.003,
+				},
+				InputInnerRadius = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "InnerRadius",
+					Default = 0.14,
+				},
+				InputRotation = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "Rotation",
+					Default = 0,
+				},
+				InputShowGrid = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "ShowGrid",
+					Default = 1,
+				},
+				InputGridOpacity = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "GridOpacity",
+					Default = 0.25,
+				},
+				InputBgOpacity = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "BgOpacity",
+					Default = 0,
+				},
+				InputBgRed = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "BgRed",
+					Name = "Background Color",
+					ControlGroup = 10,
+					Default = 0.04,
+				},
+				InputBgGreen = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "BgGreen",
+					ControlGroup = 10,
+					Default = 0.05,
+				},
+				InputBgBlue = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "BgBlue",
+					ControlGroup = 10,
+					Default = 0.08,
+				},
+				InputBgAlpha = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "BgAlpha",
+					ControlGroup = 10,
+					Default = 1,
+				},
+
+				InputColorMode = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "ColorMode",
+					Page = "Color",
+					Default = 1,
+				},
+				InputLowRed = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "LowRed",
+					Name = "Primary / Low Color",
+					ControlGroup = 1,
+					Default = 0,
+				},
+				InputLowGreen = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "LowGreen",
+					ControlGroup = 1,
+					Default = 0.85,
+				},
+				InputLowBlue = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "LowBlue",
+					ControlGroup = 1,
+					Default = 1,
+				},
+				InputLowAlpha = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "LowAlpha",
+					ControlGroup = 1,
+					Default = 1,
+				},
+				InputMidRed = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "MidRed",
+					Name = "Mid Color",
+					ControlGroup = 2,
+					Default = 0.45,
+				},
+				InputMidGreen = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "MidGreen",
+					ControlGroup = 2,
+					Default = 0.35,
+				},
+				InputMidBlue = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "MidBlue",
+					ControlGroup = 2,
+					Default = 1,
+				},
+				InputMidAlpha = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "MidAlpha",
+					ControlGroup = 2,
+					Default = 1,
+				},
+				InputHighRed = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HighRed",
+					Name = "High / Peak Color",
+					ControlGroup = 3,
+					Default = 1,
+				},
+				InputHighGreen = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HighGreen",
+					ControlGroup = 3,
+					Default = 0.22,
+				},
+				InputHighBlue = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HighBlue",
+					ControlGroup = 3,
+					Default = 0.55,
+				},
+				InputHighAlpha = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HighAlpha",
+					ControlGroup = 3,
+					Default = 1,
+				},
+				InputPeakRed = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "PeakRed",
+					Name = "Peak Cap Color",
+					ControlGroup = 4,
+					Default = 1,
+				},
+				InputPeakGreen = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "PeakGreen",
+					ControlGroup = 4,
+					Default = 1,
+				},
+				InputPeakBlue = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "PeakBlue",
+					ControlGroup = 4,
+					Default = 1,
+				},
+				InputPeakAlpha = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "PeakAlpha",
+					ControlGroup = 4,
+					Default = 1,
+				},
+				InputLedSegments = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "LedSegments",
+					Default = 18,
+				},
+				InputHaloGlow = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HaloGlow",
+					Default = 0.25,
+				},
+				InputSpectrumOpacity = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "SpectrumOpacity",
+					Default = 1,
+				},
+			},
+			Outputs = {
+				MainOutput1 = InstanceOutput {
+					SourceOp = "AudioSpectrum1",
+					Source = "Output",
+				}
+			},
+			ViewInfo = GroupInfo { Pos = { 0, 0 } },
+			Tools = ordered() {
+				Background1 = Background {
+					Inputs = {
+						GlobalOut = Input { Value = 119, },
+						Width = Input { Value = 1920, },
+						Height = Input { Value = 1080, },
+						UseFrameFormatSettings = Input { Value = 1, },
+						["Gamut.SLogVersion"] = Input { Value = FuID { "SLog2" }, },
+						TopLeftAlpha = Input { Value = 0, },
+					},
+					ViewInfo = OperatorInfo { Pos = { -160, 0 } },
+				},
+				AudioSpectrum1 = Fuse.AudioSpectrumAnalyzer {
+					CtrlWZoom = false,
+					Inputs = {
+						Input = Input {
+							SourceOp = "Background1",
+							Source = "Output",
+						},
+						CompositeOverInput = Input { Value = 0, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, 0 } },
+				}
+			},
+		}
+	},
+	ActiveTool = "Audio Spectrum Analyzer"
+}
