@@ -126,15 +126,18 @@ chmod +x install_mac_linux.sh
 | | `Audio Channel` | `Mix (L+R)` / `Left` / `Right` |
 | | `Auto Timeline FPS` / `Timeline FPS` | プロジェクトFPSの自動検出 / 手動設定 |
 | | `Audio Offset (sec)` | 音声同期オフセット（秒） |
-| | `Visual Style` | 6種類のグラフ描画スタイル |
-| | `Bands` / `Mirror Mode` / `Peak Hold Caps` | バンド数、対称ミラー表示、ピークキャップ |
+| | `Display Options` | `Digital` / `Analog Lines` / `Analog Dots` / `Segmented LED` / `Filled Area` / `Circular Bars` / `Circular Line` |
+| | `Side Options` | `Side A`（上/外側）/ `Side B`（下/内側）/ `Side A & B`（両側対称） |
+| | `Frequency Bands` / `Peak Hold Caps` | バンド数（8〜128）、ピークキャップ表示 |
 | **Analysis** | `FFT Size` / `Window Function` | FFT分解能と窓関数 |
-| | `Frequency Scale` / `Min Freq` / `Max Freq` | 対数・線形スケールと表示周波数帯域 |
+| | `Frequency Scale` / `Start Freq` / `End Freq` | 対数・線形スケールと開始・終了周波数（Hz） |
 | | `Gain (dB)` / `Noise Floor (dB)` / `Tilt Slope` | 感度・下限ノイズフロア・高域傾き補正 |
 | | `Attack Smoothing` / `Release Decay` / `Peak Fall Speed` | 立ち上がり・減衰の滑らかさ、ピーク落下速度 |
-| **Layout** | `Center` / `Graph Width` / `Graph Height` | 表示位置・グラフサイズ（ビューワ上でドラッグ操作可） |
-| | `Bar Spacing` / `Line Thickness` / `Circular Inner Radius` / `Rotation` | バー間隔、線の太さ、円形スタイルの内径・回転 |
+| **Layout** | `Placement Mode` / `Start Point` / `End Point` | AE式の2点ドラッグ配置（斜め可）または `Center & Size` |
+| | `Maximum Height` / `Bar Spacing` / `Thickness` / `Round Bar Caps` | 最大高さ、バー間隔、太さ、丸角キャップ |
+| | `Circular Inner Radius` / `Rotation` / `Arc Sweep` | 円形スタイルの内径・回転・扇形角度（30°〜360°） |
 | | `Show Grid & Baseline` / `Composite Over Input` / `Bg Color` | 補助グリッド、元映像への合成、背景ティント |
-| **Color** | `Color Mode` | `Solid` / `Frequency Gradient` / `Level Meter` / `Rainbow` |
-| | `Primary / Mid / High / Peak Cap Color` | 各帯域とピークキャップの配色 |
-| | `LED Segments` / `Neon Halo Intensity` / `Spectrum Opacity` | LED分割数、ネオン発光強度、全体の不透明度 |
+| **Color** | `Color Mode` | `AE Inside / Outside` / `Frequency Gradient` / `Level Meter` / `Rainbow` |
+| | `Inside / Outside / Mid / Peak Cap Color` | 芯・外側グロー・中間色・ピークキャップの配色 |
+| | `Hue Interpolation (deg)` / `Softness (AE Glow)` | 色相補間回転、AE風の柔らかい発光（Softness） |
+| | `LED Segments` / `Spectrum Opacity` | LED分割数、全体の不透明度 |

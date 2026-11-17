@@ -621,13 +621,34 @@ local function compute_smoothed_spectrum(wav, frame_idx, params)
 end
 
 --------------------------------------------------------------------------------
--- Color Helpers
+-- Color Helpers (including AE Hue Interpolation)
 --------------------------------------------------------------------------------
 local function lerp(a, b, t)
     return a + (b - a) * t
 end
 
+local function rgb_to_hsv(r, g, b)
+    local maxc = math.max(r, g, b)
+    local minc = math.min(r, g, b)
+    local v = maxc
+    local d = maxc - minc
+    local s = (maxc > 1e-6) and (d / maxc) or 0.0
+    local h = 0.0
+    if d > 1e-6 then
+        if maxc == r then
+            h = ((g - b) / d) % 6.0
+        elseif maxc == g then
+            h = (b - r) / d + 2.0
+        else
+            h = (r - g) / d + 4.0
+        end
+        h = h / 6.0
+    end
+    return h, s, v
+end
+
 local function hsv_to_rgb(h, s, v)
+    h = h % 1.0
     local i = math.floor(h * 6.0)
     local f = h * 6.0 - i
     local p = v * (1.0 - s)
@@ -643,10 +664,20 @@ local function hsv_to_rgb(h, s, v)
     end
 end
 
-local function get_band_color(t_freq, color_mode, c1, c2, c3, opacity)
+local function shift_hue(r, g, b, deg)
+    if math.abs(deg) < 0.01 then
+        return r, g, b
+    end
+    local h, s, v = rgb_to_hsv(r, g, b)
+    return hsv_to_rgb((h + deg / 360.0) % 1.0, s, v)
+end
+
+local function get_band_color(t_freq, color_mode, c1, c2, c3, opacity, hue_interp)
     local r, g, b, a
     if color_mode == 0 then
-        r, g, b, a = c1.R, c1.G, c1.B, c1.A
+        -- AE Inside / Outside mode: core uses Inside Color (c1) with optional Hue Interpolation
+        r, g, b = shift_hue(c1.R, c1.G, c1.B, t_freq * (hue_interp or 0.0))
+        a = c1.A
     elseif color_mode == 1 then
         if t_freq <= 0.5 then
             local k = t_freq * 2.0
@@ -661,8 +692,8 @@ local function get_band_color(t_freq, color_mode, c1, c2, c3, opacity)
             b = lerp(c2.B, c3.B, k)
             a = lerp(c2.A, c3.A, k)
         end
+        r, g, b = shift_hue(r, g, b, t_freq * (hue_interp or 0.0))
     elseif color_mode == 2 then
-        -- Level meter default fallback across bands if used as gradient
         if t_freq <= 0.6 then
             local k = t_freq / 0.6
             r = lerp(0.1, 0.95, k)
@@ -677,7 +708,7 @@ local function get_band_color(t_freq, color_mode, c1, c2, c3, opacity)
             a = 1.0
         end
     else
-        r, g, b = hsv_to_rgb((t_freq * 0.82) % 1.0, 0.88, 1.0)
+        r, g, b = hsv_to_rgb((t_freq * 0.82 + (hue_interp or 0.0) / 360.0) % 1.0, 0.88, 1.0)
         a = 1.0
     end
     return r, g, b, a * opacity
@@ -703,6 +734,43 @@ local function add_quad_to_shape(sh, x1, y1, x2, y2, x3, y3, x4, y4)
     sh:LineTo(x3, y3)
     sh:LineTo(x4, y4)
     sh:Close()
+end
+
+local function add_circle_to_shape(sh, cx, cy, radius, segs)
+    if radius <= 0.0 then return end
+    local n = segs or 14
+    for s = 0, n - 1 do
+        local a = (s / n) * TWO_PI
+        local px = cx + radius * math.cos(a)
+        local py = cy + radius * math.sin(a)
+        if s == 0 then
+            sh:MoveTo(px, py)
+        else
+            sh:LineTo(px, py)
+        end
+    end
+    sh:Close()
+end
+
+-- Oriented bar along unit tangent (ux, uy) and perpendicular normal (nx, ny)
+local function add_oriented_bar_to_shape(sh, bx, by, ux, uy, nx, ny, half_w, h_neg, h_pos, round_caps)
+    local p1x = bx - ux * half_w + nx * h_neg
+    local p1y = by - uy * half_w + ny * h_neg
+    local p2x = bx + ux * half_w + nx * h_neg
+    local p2y = by + uy * half_w + ny * h_neg
+    local p3x = bx + ux * half_w + nx * h_pos
+    local p3y = by + uy * half_w + ny * h_pos
+    local p4x = bx - ux * half_w + nx * h_pos
+    local p4y = by - uy * half_w + ny * h_pos
+    add_quad_to_shape(sh, p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y)
+    if round_caps and half_w > 0.0005 then
+        if h_pos > 0.0005 then
+            add_circle_to_shape(sh, bx + nx * h_pos, by + ny * h_pos, half_w, 10)
+        end
+        if h_neg < -0.0005 then
+            add_circle_to_shape(sh, bx + nx * h_neg, by + ny * h_neg, half_w, 10)
+        end
+    end
 end
 
 local function draw_shape(img, sh, r, g, b, a, quality)
@@ -781,20 +849,31 @@ function Create()
         INP_MaxScale = 10.0,
     })
 
-    InStyle = self:AddInput("Visual Style", "VisualStyle", {
+    InStyle = self:AddInput("Display Options", "VisualStyle", {
         LINKID_DataType = "Number",
         INPID_InputControl = "ComboControl",
         INP_Default = 0,
         INP_Integer = true,
-        { CCS_AddString = "Bars" },
+        { CCS_AddString = "Digital (AE Bars)" },
+        { CCS_AddString = "Analog Lines" },
+        { CCS_AddString = "Analog Dots" },
         { CCS_AddString = "Segmented LED" },
-        { CCS_AddString = "Line Curve" },
         { CCS_AddString = "Filled Area" },
-        { CCS_AddString = "Circular Bars" },
-        { CCS_AddString = "Circular Line" },
+        { CCS_AddString = "Circular Bars (Polar)" },
+        { CCS_AddString = "Circular Line (Polar)" },
     })
 
-    InBands = self:AddInput("Bands", "Bands", {
+    InSideOptions = self:AddInput("Side Options", "SideOptions", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 2,
+        INP_Integer = true,
+        { CCS_AddString = "Side A (Top / Outer)" },
+        { CCS_AddString = "Side B (Bottom / Inner)" },
+        { CCS_AddString = "Side A & B (Mirror)" },
+    })
+
+    InBands = self:AddInput("Frequency Bands", "Bands", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
         INP_Default = 48,
@@ -805,17 +884,10 @@ function Create()
         INP_MaxScale = 96,
     })
 
-    InMirror = self:AddInput("Mirror Mode", "MirrorMode", {
-        LINKID_DataType = "Number",
-        INPID_InputControl = "CheckboxControl",
-        INP_Default = 0,
-        INP_Integer = true,
-    })
-
     InPeakHold = self:AddInput("Peak Hold Caps", "PeakHold", {
         LINKID_DataType = "Number",
         INPID_InputControl = "CheckboxControl",
-        INP_Default = 1,
+        INP_Default = 0,
         INP_Integer = true,
     })
 
@@ -854,17 +926,17 @@ function Create()
         { CCS_AddString = "Linear" },
     })
 
-    InMinFreq = self:AddInput("Min Frequency (Hz)", "MinFreq", {
+    InMinFreq = self:AddInput("Start Frequency (Hz)", "MinFreq", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
-        INP_Default = 30.0,
+        INP_Default = 20.0,
         INP_MinAllowed = 10.0,
         INP_MaxAllowed = 5000.0,
         INP_MinScale = 20.0,
         INP_MaxScale = 500.0,
     })
 
-    InMaxFreq = self:AddInput("Max Frequency (Hz)", "MaxFreq", {
+    InMaxFreq = self:AddInput("End Frequency (Hz)", "MaxFreq", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
         INP_Default = 16000.0,
@@ -935,9 +1007,34 @@ function Create()
     })
 
     ----------------------------------------------------------------------------
-    -- Tab 3: Layout
+    -- Tab 3: Layout (AE Start/End Points + Polar)
     ----------------------------------------------------------------------------
     self:AddControlPage("Layout")
+
+    InPlacementMode = self:AddInput("Placement Mode", "PlacementMode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0,
+        INP_Integer = true,
+        { CCS_AddString = "Start / End Points (AE Style)" },
+        { CCS_AddString = "Center & Size" },
+    })
+
+    InStartPoint = self:AddInput("Start Point", "StartPoint", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INPID_PreviewControl = "CrosshairControl",
+        INP_DefaultX = 0.12,
+        INP_DefaultY = 0.5,
+    })
+
+    InEndPoint = self:AddInput("End Point", "EndPoint", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INPID_PreviewControl = "CrosshairControl",
+        INP_DefaultX = 0.88,
+        INP_DefaultY = 0.5,
+    })
 
     InCenter = self:AddInput("Center", "Center", {
         LINKID_DataType = "Point",
@@ -957,10 +1054,10 @@ function Create()
         INP_MaxScale = 1.0,
     })
 
-    InGraphHeight = self:AddInput("Graph Height", "GraphHeight", {
+    InGraphHeight = self:AddInput("Maximum Height", "GraphHeight", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
-        INP_Default = 0.45,
+        INP_Default = 0.42,
         INP_MinAllowed = 0.05,
         INP_MaxAllowed = 1.0,
         INP_MinScale = 0.1,
@@ -977,14 +1074,21 @@ function Create()
         INP_MaxScale = 0.8,
     })
 
-    InLineWidth = self:AddInput("Line / Cap Thickness", "LineWidth", {
+    InLineWidth = self:AddInput("Thickness (Line / Dot)", "LineWidth", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
-        INP_Default = 0.003,
+        INP_Default = 0.0035,
         INP_MinAllowed = 0.0005,
         INP_MaxAllowed = 0.025,
         INP_MinScale = 0.001,
         INP_MaxScale = 0.015,
+    })
+
+    InRoundCaps = self:AddInput("Round Bar Caps", "RoundCaps", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 1,
+        INP_Integer = true,
     })
 
     InInnerRadius = self:AddInput("Circular Inner Radius", "InnerRadius", {
@@ -1007,10 +1111,20 @@ function Create()
         INP_MaxScale = 180.0,
     })
 
+    InArcSweep = self:AddInput("Circular Arc Sweep (deg)", "ArcSweep", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 360.0,
+        INP_MinAllowed = 30.0,
+        INP_MaxAllowed = 360.0,
+        INP_MinScale = 90.0,
+        INP_MaxScale = 360.0,
+    })
+
     InShowGrid = self:AddInput("Show Grid & Baseline", "ShowGrid", {
         LINKID_DataType = "Number",
         INPID_InputControl = "CheckboxControl",
-        INP_Default = 1,
+        INP_Default = 0,
         INP_Integer = true,
     })
 
@@ -1090,17 +1204,17 @@ function Create()
     })
 
     ----------------------------------------------------------------------------
-    -- Tab 4: Color
+    -- Tab 4: Color (AE Inside/Outside + Hue Interpolation + Softness)
     ----------------------------------------------------------------------------
     self:AddControlPage("Color")
 
     InColorMode = self:AddInput("Color Mode", "ColorMode", {
         LINKID_DataType = "Number",
         INPID_InputControl = "ComboControl",
-        INP_Default = 1,
+        INP_Default = 0,
         INP_Integer = true,
-        { CCS_AddString = "Solid Color" },
-        { CCS_AddString = "Frequency Gradient" },
+        { CCS_AddString = "AE Inside / Outside" },
+        { CCS_AddString = "Frequency Gradient (3-Color)" },
         { CCS_AddString = "Level Meter (G/Y/R)" },
         { CCS_AddString = "Rainbow" },
     })
@@ -1108,17 +1222,17 @@ function Create()
     InColor1R = self:AddInput("Low Red", "LowRed", {
         LINKID_DataType = "Number",
         INPID_InputControl = "ColorControl",
-        ICS_Name = "Primary / Low Color",
+        ICS_Name = "Inside / Low Color",
         IC_ControlGroup = 1,
         IC_ControlID = 0,
-        INP_Default = 0.0,
+        INP_Default = 0.92,
     })
     InColor1G = self:AddInput("Low Green", "LowGreen", {
         LINKID_DataType = "Number",
         INPID_InputControl = "ColorControl",
         IC_ControlGroup = 1,
         IC_ControlID = 1,
-        INP_Default = 0.85,
+        INP_Default = 0.98,
     })
     InColor1B = self:AddInput("Low Blue", "LowBlue", {
         LINKID_DataType = "Number",
@@ -1135,10 +1249,40 @@ function Create()
         INP_Default = 1.0,
     })
 
+    InColor3R = self:AddInput("High Red", "HighRed", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        ICS_Name = "Outside / High Color",
+        IC_ControlGroup = 3,
+        IC_ControlID = 0,
+        INP_Default = 1.0,
+    })
+    InColor3G = self:AddInput("High Green", "HighGreen", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 3,
+        IC_ControlID = 1,
+        INP_Default = 0.16,
+    })
+    InColor3B = self:AddInput("High Blue", "HighBlue", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 3,
+        IC_ControlID = 2,
+        INP_Default = 0.62,
+    })
+    InColor3A = self:AddInput("High Alpha", "HighAlpha", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = 3,
+        IC_ControlID = 3,
+        INP_Default = 1.0,
+    })
+
     InColor2R = self:AddInput("Mid Red", "MidRed", {
         LINKID_DataType = "Number",
         INPID_InputControl = "ColorControl",
-        ICS_Name = "Mid Color",
+        ICS_Name = "Mid Color (3-Color Grad)",
         IC_ControlGroup = 2,
         IC_ControlID = 0,
         INP_Default = 0.45,
@@ -1161,36 +1305,6 @@ function Create()
         LINKID_DataType = "Number",
         INPID_InputControl = "ColorControl",
         IC_ControlGroup = 2,
-        IC_ControlID = 3,
-        INP_Default = 1.0,
-    })
-
-    InColor3R = self:AddInput("High Red", "HighRed", {
-        LINKID_DataType = "Number",
-        INPID_InputControl = "ColorControl",
-        ICS_Name = "High / Peak Color",
-        IC_ControlGroup = 3,
-        IC_ControlID = 0,
-        INP_Default = 1.0,
-    })
-    InColor3G = self:AddInput("High Green", "HighGreen", {
-        LINKID_DataType = "Number",
-        INPID_InputControl = "ColorControl",
-        IC_ControlGroup = 3,
-        IC_ControlID = 1,
-        INP_Default = 0.22,
-    })
-    InColor3B = self:AddInput("High Blue", "HighBlue", {
-        LINKID_DataType = "Number",
-        INPID_InputControl = "ColorControl",
-        IC_ControlGroup = 3,
-        IC_ControlID = 2,
-        INP_Default = 0.55,
-    })
-    InColor3A = self:AddInput("High Alpha", "HighAlpha", {
-        LINKID_DataType = "Number",
-        INPID_InputControl = "ColorControl",
-        IC_ControlGroup = 3,
         IC_ControlID = 3,
         INP_Default = 1.0,
     })
@@ -1225,6 +1339,24 @@ function Create()
         INP_Default = 1.0,
     })
 
+    InHueInterp = self:AddInput("Hue Interpolation (deg)", "HueInterp", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinAllowed = -720.0,
+        INP_MaxAllowed = 720.0,
+        INP_MinScale = -360.0,
+        INP_MaxScale = 360.0,
+    })
+
+    InHaloGlow = self:AddInput("Softness (AE Glow)", "HaloGlow", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.35,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 1.0,
+    })
+
     InLedSegments = self:AddInput("LED Segments", "LedSegments", {
         LINKID_DataType = "Number",
         INPID_InputControl = "SliderControl",
@@ -1234,14 +1366,6 @@ function Create()
         INP_MaxAllowed = 48,
         INP_MinScale = 6,
         INP_MaxScale = 32,
-    })
-
-    InHaloGlow = self:AddInput("Neon Halo Intensity", "HaloGlow", {
-        LINKID_DataType = "Number",
-        INPID_InputControl = "SliderControl",
-        INP_Default = 0.25,
-        INP_MinAllowed = 0.0,
-        INP_MaxAllowed = 1.0,
     })
 
     InSpectrumOpacity = self:AddInput("Spectrum Opacity", "SpectrumOpacity", {
@@ -1282,20 +1406,31 @@ end
 --------------------------------------------------------------------------------
 -- Rendering Functions
 --------------------------------------------------------------------------------
-local function render_grid(out, aspect, style, cx, cy, x0, x1, y_bottom, y_top, y_base, gw, gh, mirror, inner_r, grid_opacity, quality)
+local function get_side_extents(val, max_h, side_mode, min_h)
+    if side_mode == 0 then
+        return 0.0, math.max(val * max_h, min_h)
+    elseif side_mode == 1 then
+        return -math.max(val * max_h, min_h), 0.0
+    else
+        local hh = math.max(val * max_h * 0.5, min_h * 0.5)
+        return -hh, hh
+    end
+end
+
+local function render_grid(out, style, cx, cy, sx, sy, ex, ey, ux, uy, nx, ny, gh, side_mode, inner_r, rot_rad, arc_rad, grid_opacity, quality)
     if grid_opacity <= 0.001 then
         return
     end
     local grid_shape = Shape()
     local stroke_w = 0.0012
 
-    if style == 4 or style == 5 then
+    if style == 5 or style == 6 then
         local max_r = gh * 0.5
         local rings = { inner_r, inner_r + max_r * 0.5, inner_r + max_r }
         local segs = 72
         for _, r in ipairs(rings) do
             for s = 0, segs do
-                local ang = (s / segs) * TWO_PI
+                local ang = rot_rad + (s / segs) * arc_rad
                 local px = cx + r * math.cos(ang)
                 local py = cy + r * math.sin(ang)
                 if s == 0 then
@@ -1306,23 +1441,27 @@ local function render_grid(out, aspect, style, cx, cy, x0, x1, y_bottom, y_top, 
             end
         end
     else
-        -- Horizontal dB guide lines (0%, 25%, 50%, 75%, 100%)
+        local h_min, h_max
+        if side_mode == 0 then
+            h_min, h_max = 0.0, gh
+        elseif side_mode == 1 then
+            h_min, h_max = -gh, 0.0
+        else
+            h_min, h_max = -gh * 0.5, gh * 0.5
+        end
         local divs = 4
         for i = 0, divs do
-            local gy = y_bottom + (gh * i / divs)
-            grid_shape:MoveTo(x0, gy)
-            grid_shape:LineTo(x1, gy)
+            local h = lerp(h_min, h_max, i / divs)
+            grid_shape:MoveTo(sx + nx * h, sy + ny * h)
+            grid_shape:LineTo(ex + nx * h, ey + ny * h)
         end
-        -- Vertical octave guide lines
         local vdivs = 8
         for i = 0, vdivs do
-            local gx = x0 + (gw * i / vdivs)
-            grid_shape:MoveTo(gx, y_bottom)
-            grid_shape:LineTo(gx, y_top)
-        end
-        if mirror then
-            grid_shape:MoveTo(x0, y_base)
-            grid_shape:LineTo(x1, y_base)
+            local t = i / vdivs
+            local bx = lerp(sx, ex, t)
+            local by = lerp(sy, ey, t)
+            grid_shape:MoveTo(bx + nx * h_min, by + ny * h_min)
+            grid_shape:LineTo(bx + nx * h_max, by + ny * h_max)
         end
     end
 
@@ -1334,17 +1473,41 @@ local function render_spectrum(out, levels, peaks, opts)
     local aspect = (out.Height * out.YScale) / (out.Width * out.XScale)
     local quality = opts.quick and 4 or 8
 
-    local cx = opts.center_x
-    local cy = opts.center_y * aspect
-    local gw = opts.graph_w
     local gh = opts.graph_h * aspect
-    local x0 = cx - gw * 0.5
-    local x1 = cx + gw * 0.5
-    local y_bottom = cy - gh * 0.5
-    local y_top = cy + gh * 0.5
-    local mirror = opts.mirror
-    local y_base = mirror and cy or y_bottom
-    local max_h = mirror and (gh * 0.5) or gh
+    local sx, sy, ex, ey, cx, cy, gw, ux, uy, nx, ny
+    if opts.placement_mode == 0 then
+        sx = opts.start_x
+        sy = opts.start_y * aspect
+        ex = opts.end_x
+        ey = opts.end_y * aspect
+        local dx = ex - sx
+        local dy = ey - sy
+        local dist = math.sqrt(dx * dx + dy * dy)
+        if dist < 1e-4 then
+            dx, dy, dist = 0.01, 0.0, 0.01
+            ex = sx + 0.01
+        end
+        ux, uy = dx / dist, dy / dist
+        nx, ny = -uy, ux
+        cx = (sx + ex) * 0.5
+        cy = (sy + ey) * 0.5
+        gw = dist
+    else
+        cx = opts.center_x
+        cy = opts.center_y * aspect
+        gw = opts.graph_w
+        sx = cx - gw * 0.5
+        sy = cy
+        ex = cx + gw * 0.5
+        ey = cy
+        ux, uy = 1.0, 0.0
+        nx, ny = 0.0, 1.0
+    end
+
+    local side_mode = opts.side_mode
+    local max_h = gh
+    local rot_rad = (opts.rotation * math.pi) / 180.0
+    local arc_rad = (math.max(30.0, math.min(360.0, opts.arc_sweep)) * math.pi) / 180.0
 
     -- Optional tinted backdrop
     if opts.bg_opacity > 0.001 then
@@ -1355,7 +1518,7 @@ local function render_spectrum(out, levels, peaks, opts)
 
     -- Optional Grid & Baseline
     if opts.show_grid then
-        render_grid(out, aspect, opts.style, cx, cy, x0, x1, y_bottom, y_top, y_base, gw, gh, mirror, opts.inner_r, opts.grid_opacity, quality)
+        render_grid(out, opts.style, cx, cy, sx, sy, ex, ey, ux, uy, nx, ny, gh, side_mode, opts.inner_r, rot_rad, arc_rad, opts.grid_opacity, quality)
     end
 
     local num_bands = #levels
@@ -1366,129 +1529,259 @@ local function render_spectrum(out, levels, peaks, opts)
     local halo = opts.halo
     local gap = opts.bar_gap
     local line_w = opts.line_w
+    local round_caps = opts.round_caps
+    local hue_interp = opts.hue_interp
 
     ----------------------------------------------------------------------------
-    -- Style 0: Bars
+    -- Style 0: Digital (AE Bars)
     ----------------------------------------------------------------------------
     if style == 0 then
         local slot_w = gw / num_bands
-        local bar_w = math.max(0.0008, slot_w * (1.0 - gap))
+        local half_w = math.max(0.0005, slot_w * (1.0 - gap) * 0.5)
         local min_h = 0.0015 * aspect
+        local buckets = math.min(num_bands, 24)
+        local core_shapes = {}
+        local glow_inner = (halo > 0.01) and {} or nil
+        local glow_outer = (halo > 0.01) and {} or nil
+        for k = 1, buckets do
+            core_shapes[k] = Shape()
+            if glow_inner then
+                glow_inner[k] = Shape()
+                glow_outer[k] = Shape()
+            end
+        end
 
-        if color_mode == 0 then
-            local sh = Shape()
-            local halo_sh = (halo > 0.01) and Shape() or nil
-            for i = 1, num_bands do
-                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
-                local bx1 = bx0 + bar_w
-                local bh = math.max(levels[i] * max_h, min_h)
-                if mirror then
-                    add_rect_to_shape(sh, bx0, cy - bh, bx1, cy + bh)
-                    if halo_sh then
-                        local pad = bar_w * 0.35
-                        add_rect_to_shape(halo_sh, bx0 - pad, cy - bh - pad, bx1 + pad, cy + bh + pad)
-                    end
-                else
-                    add_rect_to_shape(sh, bx0, y_bottom, bx1, y_bottom + bh)
-                    if halo_sh then
-                        local pad = bar_w * 0.35
-                        add_rect_to_shape(halo_sh, bx0 - pad, y_bottom, bx1 + pad, y_bottom + bh + pad)
-                    end
+        for i = 1, num_bands do
+            local t_pos = (i - 0.5) / num_bands
+            local t_freq = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.0
+            local t_color = (color_mode == 2) and levels[i] or t_freq
+            local b_idx = math.max(1, math.min(buckets, math.floor(t_color * (buckets - 1) + 0.5) + 1))
+
+            local bx = lerp(sx, ex, t_pos)
+            local by = lerp(sy, ey, t_pos)
+            local h_neg, h_pos = get_side_extents(levels[i], max_h, side_mode, min_h)
+            add_oriented_bar_to_shape(core_shapes[b_idx], bx, by, ux, uy, nx, ny, half_w, h_neg, h_pos, round_caps)
+
+            if glow_inner then
+                local pad1 = half_w * (0.45 + 0.55 * halo)
+                local pad2 = half_w * (0.95 + 1.35 * halo)
+                local gn1 = (h_neg < 0) and (h_neg - pad1) or 0.0
+                local gp1 = (h_pos > 0) and (h_pos + pad1) or 0.0
+                local gn2 = (h_neg < 0) and (h_neg - pad2) or 0.0
+                local gp2 = (h_pos > 0) and (h_pos + pad2) or 0.0
+                add_oriented_bar_to_shape(glow_inner[b_idx], bx, by, ux, uy, nx, ny, half_w + pad1, gn1, gp1, round_caps)
+                add_oriented_bar_to_shape(glow_outer[b_idx], bx, by, ux, uy, nx, ny, half_w + pad2, gn2, gp2, round_caps)
+            end
+        end
+
+        for k = 1, buckets do
+            local tk = (buckets > 1) and ((k - 1) / (buckets - 1)) or 0.0
+            local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity, hue_interp)
+            if glow_inner then
+                local gr, gg, gb, ga = r, g, b, a
+                if color_mode == 0 then
+                    gr, gg, gb = shift_hue(c3.R, c3.G, c3.B, tk * hue_interp)
+                    ga = c3.A * opacity
                 end
+                draw_shape(out, glow_outer[k], gr, gg, gb, ga * 0.14 * halo, quality)
+                draw_shape(out, glow_inner[k], gr, gg, gb, ga * 0.32 * halo, quality)
             end
-            if halo_sh then
-                draw_shape(out, halo_sh, c1.R, c1.G, c1.B, c1.A * opacity * 0.22 * halo, quality)
-            end
-            draw_shape(out, sh, c1.R, c1.G, c1.B, c1.A * opacity, quality)
-        else
-            -- Bucket colors into <= 24 passes for speed + smooth gradients
-            local buckets = math.min(num_bands, 24)
-            local bucket_shapes = {}
-            local halo_shapes = (halo > 0.01) and {} or nil
-            for k = 1, buckets do
-                bucket_shapes[k] = Shape()
-                if halo_shapes then halo_shapes[k] = Shape() end
-            end
-
-            for i = 1, num_bands do
-                local t_freq = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.0
-                local t_color = (color_mode == 2) and levels[i] or t_freq
-                local b_idx = math.max(1, math.min(buckets, math.floor(t_color * (buckets - 1) + 0.5) + 1))
-
-                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
-                local bx1 = bx0 + bar_w
-                local bh = math.max(levels[i] * max_h, min_h)
-                if mirror then
-                    add_rect_to_shape(bucket_shapes[b_idx], bx0, cy - bh, bx1, cy + bh)
-                    if halo_shapes then
-                        local pad = bar_w * 0.35
-                        add_rect_to_shape(halo_shapes[b_idx], bx0 - pad, cy - bh - pad, bx1 + pad, cy + bh + pad)
-                    end
-                else
-                    add_rect_to_shape(bucket_shapes[b_idx], bx0, y_bottom, bx1, y_bottom + bh)
-                    if halo_shapes then
-                        local pad = bar_w * 0.35
-                        add_rect_to_shape(halo_shapes[b_idx], bx0 - pad, y_bottom, bx1 + pad, y_bottom + bh + pad)
-                    end
-                end
-            end
-
-            for k = 1, buckets do
-                local tk = (buckets > 1) and ((k - 1) / (buckets - 1)) or 0.0
-                local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity)
-                if halo_shapes then
-                    draw_shape(out, halo_shapes[k], r, g, b, a * 0.22 * halo, quality)
-                end
-                draw_shape(out, bucket_shapes[k], r, g, b, a, quality)
-            end
+            draw_shape(out, core_shapes[k], r, g, b, a, quality)
         end
 
         if opts.peak_hold then
             local psh = Shape()
             local cap_h = math.max(line_w, 0.002 * aspect)
             for i = 1, num_bands do
-                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
-                local bx1 = bx0 + bar_w
-                local ph = peaks[i] * max_h
-                if mirror then
-                    add_rect_to_shape(psh, bx0, cy + ph, bx1, cy + ph + cap_h)
-                    add_rect_to_shape(psh, bx0, cy - ph - cap_h, bx1, cy - ph)
-                else
-                    add_rect_to_shape(psh, bx0, y_bottom + ph, bx1, y_bottom + ph + cap_h)
+                local t_pos = (i - 0.5) / num_bands
+                local bx = lerp(sx, ex, t_pos)
+                local by = lerp(sy, ey, t_pos)
+                local pn, pp = get_side_extents(peaks[i], max_h, side_mode, 0.0)
+                if side_mode == 0 or side_mode == 2 then
+                    add_oriented_bar_to_shape(psh, bx, by, ux, uy, nx, ny, half_w, pp, pp + cap_h, false)
+                end
+                if side_mode == 1 or side_mode == 2 then
+                    add_oriented_bar_to_shape(psh, bx, by, ux, uy, nx, ny, half_w, pn - cap_h, pn, false)
                 end
             end
             draw_shape(out, psh, c_peak.R, c_peak.G, c_peak.B, c_peak.A * opacity, quality)
         end
 
     ----------------------------------------------------------------------------
-    -- Style 1: Segmented LED
+    -- Style 1 (Analog Lines) & Style 4 (Filled Area)
     ----------------------------------------------------------------------------
-    elseif style == 1 then
+    elseif style == 1 or style == 4 then
+        local pts_t = {}
+        local pts_h = {}
+        for i = 1, num_bands do
+            pts_t[i] = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.5
+            pts_h[i] = levels[i] * max_h
+        end
+
+        local subdiv = 3
+        local smooth_t = {}
+        local smooth_h = {}
+        for i = 1, num_bands - 1 do
+            local p0 = pts_h[math.max(1, i - 1)]
+            local p1 = pts_h[i]
+            local p2 = pts_h[i + 1]
+            local p3 = pts_h[math.min(num_bands, i + 2)]
+            for s = 0, subdiv - 1 do
+                local t = s / subdiv
+                smooth_t[#smooth_t + 1] = lerp(pts_t[i], pts_t[i + 1], t)
+                local sy_val = sample_catmull_rom(p0, p1, p2, p3, t)
+                if sy_val < 0.0 then sy_val = 0.0 end
+                if sy_val > max_h then sy_val = max_h end
+                smooth_h[#smooth_h + 1] = sy_val
+            end
+        end
+        smooth_t[#smooth_t + 1] = pts_t[num_bands]
+        smooth_h[#smooth_h + 1] = pts_h[num_bands]
+
+        local total_pts = #smooth_t
+        local buckets = math.min(num_bands, 24)
+        for b = 1, buckets do
+            local i_start = math.max(1, math.floor(((b - 1) / buckets) * (total_pts - 1)) + 1)
+            local i_end = math.min(total_pts, math.floor((b / buckets) * (total_pts - 1)) + 1)
+            if i_end > i_start then
+                local mid_k = math.floor((i_start + i_end) * 0.5)
+                local t_freq = (total_pts > 1) and ((mid_k - 1) / (total_pts - 1)) or 0.0
+                local t_color = (color_mode == 2 and max_h > 0) and (smooth_h[mid_k] / max_h) or t_freq
+                local r_b, g_b, b_b, a_b = get_band_color(t_color, color_mode, c1, c2, c3, opacity, hue_interp)
+                local gr, gg, gb, ga = r_b, g_b, b_b, a_b
+                if color_mode == 0 then
+                    gr, gg, gb = shift_hue(c3.R, c3.G, c3.B, t_freq * hue_interp)
+                    ga = c3.A * opacity
+                end
+
+                local scale_side = (side_mode == 2) and 0.5 or 1.0
+                if style == 4 then
+                    local fill_sh = Shape()
+                    if side_mode == 0 or side_mode == 2 then
+                        fill_sh:MoveTo(lerp(sx, ex, smooth_t[i_start]), lerp(sy, ey, smooth_t[i_start]))
+                        for k = i_start, i_end do
+                            local bx = lerp(sx, ex, smooth_t[k])
+                            local by = lerp(sy, ey, smooth_t[k])
+                            fill_sh:LineTo(bx + nx * smooth_h[k] * scale_side, by + ny * smooth_h[k] * scale_side)
+                        end
+                        fill_sh:LineTo(lerp(sx, ex, smooth_t[i_end]), lerp(sy, ey, smooth_t[i_end]))
+                        fill_sh:Close()
+                    end
+                    if side_mode == 1 or side_mode == 2 then
+                        fill_sh:MoveTo(lerp(sx, ex, smooth_t[i_start]), lerp(sy, ey, smooth_t[i_start]))
+                        for k = i_start, i_end do
+                            local bx = lerp(sx, ex, smooth_t[k])
+                            local by = lerp(sy, ey, smooth_t[k])
+                            fill_sh:LineTo(bx - nx * smooth_h[k] * scale_side, by - ny * smooth_h[k] * scale_side)
+                        end
+                        fill_sh:LineTo(lerp(sx, ex, smooth_t[i_end]), lerp(sy, ey, smooth_t[i_end]))
+                        fill_sh:Close()
+                    end
+                    draw_shape(out, fill_sh, gr, gg, gb, ga * 0.36, quality)
+                end
+
+                local seg_sh = Shape()
+                if side_mode == 0 or side_mode == 2 then
+                    for k = i_start, i_end do
+                        local bx = lerp(sx, ex, smooth_t[k])
+                        local by = lerp(sy, ey, smooth_t[k])
+                        local px = bx + nx * smooth_h[k] * scale_side
+                        local py = by + ny * smooth_h[k] * scale_side
+                        if k == i_start then seg_sh:MoveTo(px, py) else seg_sh:LineTo(px, py) end
+                    end
+                end
+                if side_mode == 1 or side_mode == 2 then
+                    for k = i_start, i_end do
+                        local bx = lerp(sx, ex, smooth_t[k])
+                        local by = lerp(sy, ey, smooth_t[k])
+                        local px = bx - nx * smooth_h[k] * scale_side
+                        local py = by - ny * smooth_h[k] * scale_side
+                        if k == i_start then seg_sh:MoveTo(px, py) else seg_sh:LineTo(px, py) end
+                    end
+                end
+
+                if halo > 0.01 then
+                    draw_shape(out, seg_sh:OutlineOfShape(line_w * (2.5 + 3.0 * halo), "OLT_Solid"), gr, gg, gb, ga * 0.18 * halo, quality)
+                    draw_shape(out, seg_sh:OutlineOfShape(line_w * (1.5 + 1.5 * halo), "OLT_Solid"), gr, gg, gb, ga * 0.35 * halo, quality)
+                end
+                draw_shape(out, seg_sh:OutlineOfShape(line_w, "OLT_Solid"), r_b, g_b, b_b, a_b, quality)
+            end
+        end
+
+    ----------------------------------------------------------------------------
+    -- Style 2: Analog Dots (AE Classic)
+    ----------------------------------------------------------------------------
+    elseif style == 2 then
+        local dot_r = math.max(line_w * 1.3, 0.0025)
+        local buckets = math.min(num_bands, 24)
+        local core_shapes = {}
+        local glow_shapes = (halo > 0.01) and {} or nil
+        for k = 1, buckets do
+            core_shapes[k] = Shape()
+            if glow_shapes then glow_shapes[k] = Shape() end
+        end
+
+        for i = 1, num_bands do
+            local t_pos = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.5
+            local t_color = (color_mode == 2) and levels[i] or t_pos
+            local b_idx = math.max(1, math.min(buckets, math.floor(t_color * (buckets - 1) + 0.5) + 1))
+
+            local bx = lerp(sx, ex, t_pos)
+            local by = lerp(sy, ey, t_pos)
+            local hn, hp = get_side_extents(levels[i], max_h, side_mode, 0.0)
+            if side_mode == 0 or side_mode == 2 then
+                local px, py = bx + nx * hp, by + ny * hp
+                add_circle_to_shape(core_shapes[b_idx], px, py, dot_r, 12)
+                if glow_shapes then add_circle_to_shape(glow_shapes[b_idx], px, py, dot_r * (1.8 + 1.5 * halo), 12) end
+            end
+            if side_mode == 1 or side_mode == 2 then
+                local px, py = bx + nx * hn, by + ny * hn
+                add_circle_to_shape(core_shapes[b_idx], px, py, dot_r, 12)
+                if glow_shapes then add_circle_to_shape(glow_shapes[b_idx], px, py, dot_r * (1.8 + 1.5 * halo), 12) end
+            end
+        end
+
+        for k = 1, buckets do
+            local tk = (buckets > 1) and ((k - 1) / (buckets - 1)) or 0.0
+            local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity, hue_interp)
+            if glow_shapes then
+                local gr, gg, gb, ga = r, g, b, a
+                if color_mode == 0 then
+                    gr, gg, gb = shift_hue(c3.R, c3.G, c3.B, tk * hue_interp)
+                    ga = c3.A * opacity
+                end
+                draw_shape(out, glow_shapes[k], gr, gg, gb, ga * 0.35 * halo, quality)
+            end
+            draw_shape(out, core_shapes[k], r, g, b, a, quality)
+        end
+
+    ----------------------------------------------------------------------------
+    -- Style 3: Segmented LED
+    ----------------------------------------------------------------------------
+    elseif style == 3 then
         local slot_w = gw / num_bands
-        local bar_w = math.max(0.0008, slot_w * (1.0 - gap))
+        local half_w = math.max(0.0005, slot_w * (1.0 - gap) * 0.5)
         local n_segs = opts.led_segments
-        local seg_slot = max_h / n_segs
+        local seg_span = (side_mode == 2) and (max_h * 0.5) or max_h
+        local seg_slot = seg_span / n_segs
         local seg_h = seg_slot * 0.72
 
         if color_mode == 2 then
-            -- Classic 3-zone LED Meter: Green -> Yellow -> Red
-            local sh_low = Shape()
-            local sh_mid = Shape()
-            local sh_high = Shape()
+            local sh_low, sh_mid, sh_high = Shape(), Shape(), Shape()
             for i = 1, num_bands do
-                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
-                local bx1 = bx0 + bar_w
+                local t_pos = (i - 0.5) / num_bands
+                local bx, by = lerp(sx, ex, t_pos), lerp(sy, ey, t_pos)
                 local lit = math.floor(levels[i] * n_segs + 0.5)
                 for s = 1, lit do
                     local frac = s / n_segs
                     local target = (frac <= 0.60) and sh_low or ((frac <= 0.84) and sh_mid or sh_high)
                     local sy0 = (s - 1) * seg_slot
                     local sy1 = sy0 + seg_h
-                    if mirror then
-                        add_rect_to_shape(target, bx0, cy + sy0, bx1, cy + sy1)
-                        add_rect_to_shape(target, bx0, cy - sy1, bx1, cy - sy0)
-                    else
-                        add_rect_to_shape(target, bx0, y_bottom + sy0, bx1, y_bottom + sy1)
+                    if side_mode == 0 or side_mode == 2 then
+                        add_oriented_bar_to_shape(target, bx, by, ux, uy, nx, ny, half_w, sy0, sy1, false)
+                    end
+                    if side_mode == 1 or side_mode == 2 then
+                        add_oriented_bar_to_shape(target, bx, by, ux, uy, nx, ny, half_w, -sy1, -sy0, false)
                     end
                 end
             end
@@ -1499,27 +1792,26 @@ local function render_spectrum(out, levels, peaks, opts)
             local buckets = math.min(num_bands, 24)
             local bucket_shapes = {}
             for k = 1, buckets do bucket_shapes[k] = Shape() end
-
             for i = 1, num_bands do
+                local t_pos = (i - 0.5) / num_bands
                 local t_freq = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.0
-                local b_idx = (color_mode == 0) and 1 or math.max(1, math.min(buckets, math.floor(t_freq * (buckets - 1) + 0.5) + 1))
-                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
-                local bx1 = bx0 + bar_w
+                local b_idx = math.max(1, math.min(buckets, math.floor(t_freq * (buckets - 1) + 0.5) + 1))
+                local bx, by = lerp(sx, ex, t_pos), lerp(sy, ey, t_pos)
                 local lit = math.floor(levels[i] * n_segs + 0.5)
                 for s = 1, lit do
                     local sy0 = (s - 1) * seg_slot
                     local sy1 = sy0 + seg_h
-                    if mirror then
-                        add_rect_to_shape(bucket_shapes[b_idx], bx0, cy + sy0, bx1, cy + sy1)
-                        add_rect_to_shape(bucket_shapes[b_idx], bx0, cy - sy1, bx1, cy - sy0)
-                    else
-                        add_rect_to_shape(bucket_shapes[b_idx], bx0, y_bottom + sy0, bx1, y_bottom + sy1)
+                    if side_mode == 0 or side_mode == 2 then
+                        add_oriented_bar_to_shape(bucket_shapes[b_idx], bx, by, ux, uy, nx, ny, half_w, sy0, sy1, false)
+                    end
+                    if side_mode == 1 or side_mode == 2 then
+                        add_oriented_bar_to_shape(bucket_shapes[b_idx], bx, by, ux, uy, nx, ny, half_w, -sy1, -sy0, false)
                     end
                 end
             end
-            for k = 1, (color_mode == 0 and 1 or buckets) do
+            for k = 1, buckets do
                 local tk = (buckets > 1) and ((k - 1) / (buckets - 1)) or 0.0
-                local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity)
+                local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity, hue_interp)
                 draw_shape(out, bucket_shapes[k], r, g, b, a, quality)
             end
         end
@@ -1527,17 +1819,17 @@ local function render_spectrum(out, levels, peaks, opts)
         if opts.peak_hold then
             local psh = Shape()
             for i = 1, num_bands do
-                local bx0 = x0 + (i - 0.5) * slot_w - bar_w * 0.5
-                local bx1 = bx0 + bar_w
-                local pk_seg = math.max(1, math.min(n_segs, math.floor(peaks[i] * n_segs + 0.5)))
                 if peaks[i] > 0.005 then
+                    local t_pos = (i - 0.5) / num_bands
+                    local bx, by = lerp(sx, ex, t_pos), lerp(sy, ey, t_pos)
+                    local pk_seg = math.max(1, math.min(n_segs, math.floor(peaks[i] * n_segs + 0.5)))
                     local sy0 = (pk_seg - 1) * seg_slot
                     local sy1 = sy0 + seg_h
-                    if mirror then
-                        add_rect_to_shape(psh, bx0, cy + sy0, bx1, cy + sy1)
-                        add_rect_to_shape(psh, bx0, cy - sy1, bx1, cy - sy0)
-                    else
-                        add_rect_to_shape(psh, bx0, y_bottom + sy0, bx1, y_bottom + sy1)
+                    if side_mode == 0 or side_mode == 2 then
+                        add_oriented_bar_to_shape(psh, bx, by, ux, uy, nx, ny, half_w, sy0, sy1, false)
+                    end
+                    if side_mode == 1 or side_mode == 2 then
+                        add_oriented_bar_to_shape(psh, bx, by, ux, uy, nx, ny, half_w, -sy1, -sy0, false)
                     end
                 end
             end
@@ -1545,158 +1837,43 @@ local function render_spectrum(out, levels, peaks, opts)
         end
 
     ----------------------------------------------------------------------------
-    -- Style 2 (Line Curve) & Style 3 (Filled Area)
+    -- Style 5: Circular Bars (Polar AE Style)
     ----------------------------------------------------------------------------
-    elseif style == 2 or style == 3 then
-        local pts_x = {}
-        local pts_y = {}
-        for i = 1, num_bands do
-            local tx = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.5
-            pts_x[i] = x0 + tx * gw
-            pts_y[i] = levels[i] * max_h
-        end
-
-        local subdiv = 3
-        local smooth_x = {}
-        local smooth_y = {}
-        for i = 1, num_bands - 1 do
-            local p0 = pts_y[math.max(1, i - 1)]
-            local p1 = pts_y[i]
-            local p2 = pts_y[i + 1]
-            local p3 = pts_y[math.min(num_bands, i + 2)]
-            for s = 0, subdiv - 1 do
-                local t = s / subdiv
-                smooth_x[#smooth_x + 1] = lerp(pts_x[i], pts_x[i + 1], t)
-                local sy = sample_catmull_rom(p0, p1, p2, p3, t)
-                if sy < 0.0 then sy = 0.0 end
-                if sy > max_h then sy = max_h end
-                smooth_y[#smooth_y + 1] = sy
-            end
-        end
-        smooth_x[#smooth_x + 1] = pts_x[num_bands]
-        smooth_y[#smooth_y + 1] = pts_y[num_bands]
-
-        if color_mode == 0 then
-            local r_main, g_main, b_main, a_main = c1.R, c1.G, c1.B, c1.A * opacity
-            if style == 3 then
-                local fill_sh = Shape()
-                fill_sh:MoveTo(smooth_x[1], y_base)
-                for k = 1, #smooth_x do
-                    fill_sh:LineTo(smooth_x[k], y_base + smooth_y[k])
-                end
-                fill_sh:LineTo(smooth_x[#smooth_x], y_base)
-                fill_sh:Close()
-
-                if mirror then
-                    fill_sh:MoveTo(smooth_x[1], y_base)
-                    for k = 1, #smooth_x do
-                        fill_sh:LineTo(smooth_x[k], y_base - smooth_y[k])
-                    end
-                    fill_sh:LineTo(smooth_x[#smooth_x], y_base)
-                    fill_sh:Close()
-                end
-                draw_shape(out, fill_sh, r_main, g_main, b_main, a_main * 0.42, quality)
-            end
-
-            local line_sh = Shape()
-            line_sh:MoveTo(smooth_x[1], y_base + smooth_y[1])
-            for k = 2, #smooth_x do
-                line_sh:LineTo(smooth_x[k], y_base + smooth_y[k])
-            end
-            if mirror then
-                line_sh:MoveTo(smooth_x[1], y_base - smooth_y[1])
-                for k = 2, #smooth_x do
-                    line_sh:LineTo(smooth_x[k], y_base - smooth_y[k])
-                end
-            end
-
-            if halo > 0.01 then
-                local halo_out = line_sh:OutlineOfShape(line_w * 3.2, "OLT_Solid")
-                draw_shape(out, halo_out, r_main, g_main, b_main, a_main * 0.25 * halo, quality)
-            end
-            local line_out = line_sh:OutlineOfShape(line_w, "OLT_Solid")
-            draw_shape(out, line_out, c_peak.R * 0.3 + r_main * 0.7, c_peak.G * 0.3 + g_main * 0.7, c_peak.B * 0.3 + b_main * 0.7, a_main, quality)
-        else
-            local total_pts = #smooth_x
-            local buckets = math.min(num_bands, 24)
-            for b = 1, buckets do
-                local i_start = math.max(1, math.floor(((b - 1) / buckets) * (total_pts - 1)) + 1)
-                local i_end = math.min(total_pts, math.floor((b / buckets) * (total_pts - 1)) + 1)
-                if i_end > i_start then
-                    local mid_k = math.floor((i_start + i_end) * 0.5)
-                    local t_freq = (total_pts > 1) and ((mid_k - 1) / (total_pts - 1)) or 0.0
-                    local t_color = (color_mode == 2 and max_h > 0) and (smooth_y[mid_k] / max_h) or t_freq
-                    local r_b, g_b, b_b, a_b = get_band_color(t_color, color_mode, c1, c2, c3, opacity)
-
-                    if style == 3 then
-                        local fill_sh = Shape()
-                        fill_sh:MoveTo(smooth_x[i_start], y_base)
-                        for k = i_start, i_end do
-                            fill_sh:LineTo(smooth_x[k], y_base + smooth_y[k])
-                        end
-                        fill_sh:LineTo(smooth_x[i_end], y_base)
-                        fill_sh:Close()
-
-                        if mirror then
-                            fill_sh:MoveTo(smooth_x[i_start], y_base)
-                            for k = i_start, i_end do
-                                fill_sh:LineTo(smooth_x[k], y_base - smooth_y[k])
-                            end
-                            fill_sh:LineTo(smooth_x[i_end], y_base)
-                            fill_sh:Close()
-                        end
-                        draw_shape(out, fill_sh, r_b, g_b, b_b, a_b * 0.42, quality)
-                    end
-
-                    local seg_sh = Shape()
-                    seg_sh:MoveTo(smooth_x[i_start], y_base + smooth_y[i_start])
-                    for k = i_start + 1, i_end do
-                        seg_sh:LineTo(smooth_x[k], y_base + smooth_y[k])
-                    end
-                    if mirror then
-                        seg_sh:MoveTo(smooth_x[i_start], y_base - smooth_y[i_start])
-                        for k = i_start + 1, i_end do
-                            seg_sh:LineTo(smooth_x[k], y_base - smooth_y[k])
-                        end
-                    end
-                    if halo > 0.01 then
-                        draw_shape(out, seg_sh:OutlineOfShape(line_w * 3.2, "OLT_Solid"), r_b, g_b, b_b, a_b * 0.25 * halo, quality)
-                    end
-                    draw_shape(out, seg_sh:OutlineOfShape(line_w, "OLT_Solid"), c_peak.R * 0.25 + r_b * 0.75, c_peak.G * 0.25 + g_b * 0.75, c_peak.B * 0.25 + b_b * 0.75, a_b, quality)
-                end
-            end
-        end
-
-    ----------------------------------------------------------------------------
-    -- Style 4: Circular Bars
-    ----------------------------------------------------------------------------
-    elseif style == 4 then
-        local rot_rad = (opts.rotation * math.pi) / 180.0
+    elseif style == 5 then
         local base_r = opts.inner_r
         local max_r = gh * 0.5
-        local angular_slot = TWO_PI / num_bands
+        local denom_b = (arc_rad < TWO_PI - 0.01 and num_bands > 1) and (num_bands - 1) or num_bands
+        local angular_slot = arc_rad / num_bands
         local half_ang = angular_slot * (1.0 - gap) * 0.5
-        local buckets = (color_mode == 0) and 1 or math.min(num_bands, 24)
+        local buckets = math.min(num_bands, 24)
         local bucket_shapes = {}
-        local halo_shapes = (halo > 0.01) and {} or nil
+        local glow_shapes = (halo > 0.01) and {} or nil
         for k = 1, buckets do
             bucket_shapes[k] = Shape()
-            if halo_shapes then halo_shapes[k] = Shape() end
+            if glow_shapes then glow_shapes[k] = Shape() end
         end
 
         for i = 1, num_bands do
             local t_freq = (num_bands > 1) and ((i - 1) / (num_bands - 1)) or 0.0
             local t_color = (color_mode == 2) and levels[i] or t_freq
-            local b_idx = (color_mode == 0) and 1 or math.max(1, math.min(buckets, math.floor(t_color * (buckets - 1) + 0.5) + 1))
+            local b_idx = math.max(1, math.min(buckets, math.floor(t_color * (buckets - 1) + 0.5) + 1))
 
-            local theta = rot_rad + (i - 1) * angular_slot
+            local theta = rot_rad + ((i - 1) / denom_b) * arc_rad
             local a0 = theta - half_ang
             local a1 = theta + half_ang
             local c0, s0 = math.cos(a0), math.sin(a0)
             local c1a, s1a = math.cos(a1), math.sin(a1)
 
-            local r_out = base_r + math.max(levels[i] * max_r, 0.002)
-            local r_in = mirror and math.max(0.005, base_r - levels[i] * max_r * 0.45) or base_r
+            local r_out = base_r
+            local r_in = base_r
+            if side_mode == 0 then
+                r_out = base_r + math.max(levels[i] * max_r, 0.002)
+            elseif side_mode == 1 then
+                r_in = math.max(0.005, base_r - math.max(levels[i] * max_r * 0.65, 0.002))
+            else
+                r_out = base_r + math.max(levels[i] * max_r * 0.7, 0.002)
+                r_in = math.max(0.005, base_r - math.max(levels[i] * max_r * 0.45, 0.002))
+            end
 
             add_quad_to_shape(
                 bucket_shapes[b_idx],
@@ -1706,25 +1883,31 @@ local function render_spectrum(out, levels, peaks, opts)
                 cx + r_in * c1a, cy + r_in * s1a
             )
 
-            if halo_shapes then
-                local pad = half_ang * 0.35
+            if glow_shapes then
+                local pad = half_ang * (0.45 + 0.5 * halo)
+                local rpad = 0.006 * (0.5 + halo)
                 local hc0, hs0 = math.cos(a0 - pad), math.sin(a0 - pad)
                 local hc1, hs1 = math.cos(a1 + pad), math.sin(a1 + pad)
                 add_quad_to_shape(
-                    halo_shapes[b_idx],
-                    cx + r_in * hc0, cy + r_in * hs0,
-                    cx + (r_out + 0.006) * hc0, cy + (r_out + 0.006) * hs0,
-                    cx + (r_out + 0.006) * hc1, cy + (r_out + 0.006) * hs1,
-                    cx + r_in * hc1, cy + r_in * hs1
+                    glow_shapes[b_idx],
+                    cx + math.max(0.002, r_in - rpad * 0.5) * hc0, cy + math.max(0.002, r_in - rpad * 0.5) * hs0,
+                    cx + (r_out + rpad) * hc0, cy + (r_out + rpad) * hs0,
+                    cx + (r_out + rpad) * hc1, cy + (r_out + rpad) * hs1,
+                    cx + math.max(0.002, r_in - rpad * 0.5) * hc1, cy + math.max(0.002, r_in - rpad * 0.5) * hs1
                 )
             end
         end
 
         for k = 1, buckets do
             local tk = (buckets > 1) and ((k - 1) / (buckets - 1)) or 0.0
-            local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity)
-            if halo_shapes then
-                draw_shape(out, halo_shapes[k], r, g, b, a * 0.22 * halo, quality)
+            local r, g, b, a = get_band_color(tk, color_mode, c1, c2, c3, opacity, hue_interp)
+            if glow_shapes then
+                local gr, gg, gb, ga = r, g, b, a
+                if color_mode == 0 then
+                    gr, gg, gb = shift_hue(c3.R, c3.G, c3.B, tk * hue_interp)
+                    ga = c3.A * opacity
+                end
+                draw_shape(out, glow_shapes[k], gr, gg, gb, ga * 0.30 * halo, quality)
             end
             draw_shape(out, bucket_shapes[k], r, g, b, a, quality)
         end
@@ -1733,10 +1916,10 @@ local function render_spectrum(out, levels, peaks, opts)
             local psh = Shape()
             local cap_r = math.max(line_w, 0.0025)
             for i = 1, num_bands do
-                local theta = rot_rad + (i - 1) * angular_slot
+                local theta = rot_rad + ((i - 1) / denom_b) * arc_rad
                 local a0 = theta - half_ang
                 local a1 = theta + half_ang
-                local rp0 = base_r + peaks[i] * max_r
+                local rp0 = base_r + peaks[i] * ((side_mode == 2) and (max_r * 0.7) or max_r)
                 local rp1 = rp0 + cap_r
                 add_quad_to_shape(
                     psh,
@@ -1750,26 +1933,24 @@ local function render_spectrum(out, levels, peaks, opts)
         end
 
     ----------------------------------------------------------------------------
-    -- Style 5: Circular Line
+    -- Style 6: Circular Line (Polar AE Style)
     ----------------------------------------------------------------------------
-    elseif style == 5 then
-        local rot_rad = (opts.rotation * math.pi) / 180.0
+    elseif style == 6 then
         local base_r = opts.inner_r
         local max_r = gh * 0.5
-        local angular_slot = TWO_PI / num_bands
+        local is_closed = (arc_rad >= TWO_PI - 0.01)
+        local angular_slot = is_closed and (arc_rad / num_bands) or (arc_rad / math.max(1, num_bands - 1))
         local subdiv = 3
 
-        local outer_x = {}
-        local outer_y = {}
-        local outer_val = {}
-        local inner_x = mirror and {} or nil
-        local inner_y = mirror and {} or nil
+        local outer_x, outer_y, outer_val = {}, {}, {}
+        local inner_x, inner_y = (side_mode == 1 or side_mode == 2) and {} or nil, (side_mode == 1 or side_mode == 2) and {} or nil
 
-        for i = 1, num_bands do
-            local i0 = ((i - 2) % num_bands) + 1
+        local seg_count = is_closed and num_bands or (num_bands - 1)
+        for i = 1, seg_count do
+            local i0 = is_closed and (((i - 2) % num_bands) + 1) or math.max(1, i - 1)
             local i1 = i
-            local i2 = (i % num_bands) + 1
-            local i3 = ((i + 1) % num_bands) + 1
+            local i2 = is_closed and ((i % num_bands) + 1) or math.min(num_bands, i + 1)
+            local i3 = is_closed and (((i + 1) % num_bands) + 1) or math.min(num_bands, i + 2)
             local base_ang = rot_rad + (i - 1) * angular_slot
 
             for s = 0, subdiv - 1 do
@@ -1780,7 +1961,7 @@ local function render_spectrum(out, levels, peaks, opts)
                 local ang = base_ang + t * angular_slot
                 local ca, sa = math.cos(ang), math.sin(ang)
 
-                local r_out = base_r + val * max_r
+                local r_out = (side_mode == 1) and base_r or (base_r + val * max_r * ((side_mode == 2) and 0.7 or 1.0))
                 outer_x[#outer_x + 1] = cx + r_out * ca
                 outer_y[#outer_y + 1] = cy + r_out * sa
                 outer_val[#outer_val + 1] = val
@@ -1793,64 +1974,73 @@ local function render_spectrum(out, levels, peaks, opts)
             end
         end
 
-        local outer_sh = Shape()
-        outer_sh:MoveTo(outer_x[1], outer_y[1])
-        for k = 2, #outer_x do
-            outer_sh:LineTo(outer_x[k], outer_y[k])
-        end
-        outer_sh:LineTo(outer_x[1], outer_y[1])
-        outer_sh:Close()
-
-        local r_main, g_main, b_main, a_main
-        if color_mode == 0 then
-            r_main, g_main, b_main, a_main = c1.R, c1.G, c1.B, c1.A * opacity
-        else
-            r_main, g_main, b_main, a_main = get_band_color(0.35, 1, c1, c2, c3, opacity)
-        end
-
-        -- Subtle inner glow fill
-        draw_shape(out, outer_sh, r_main, g_main, b_main, a_main * 0.16, quality)
-
-        if color_mode == 0 then
-            if halo > 0.01 then
-                draw_shape(out, outer_sh:OutlineOfShape(line_w * 3.0, "OLT_Solid"), r_main, g_main, b_main, a_main * 0.25 * halo, quality)
+        if not is_closed then
+            local ang = rot_rad + arc_rad
+            local val = levels[num_bands]
+            local r_out = (side_mode == 1) and base_r or (base_r + val * max_r * ((side_mode == 2) and 0.7 or 1.0))
+            outer_x[#outer_x + 1] = cx + r_out * math.cos(ang)
+            outer_y[#outer_y + 1] = cy + r_out * math.sin(ang)
+            outer_val[#outer_val + 1] = val
+            if inner_x then
+                local r_in = math.max(0.005, base_r - val * max_r * 0.45)
+                inner_x[#inner_x + 1] = cx + r_in * math.cos(ang)
+                inner_y[#inner_y + 1] = cy + r_in * math.sin(ang)
             end
-            draw_shape(out, outer_sh:OutlineOfShape(line_w, "OLT_Solid"), r_main, g_main, b_main, a_main, quality)
-        else
-            local total_pts = #outer_x
-            local buckets = math.min(num_bands, 24)
-            for b = 1, buckets do
-                local i_start = math.max(1, math.floor(((b - 1) / buckets) * total_pts) + 1)
-                local i_end = math.min(total_pts + 1, math.floor((b / buckets) * total_pts) + 1)
-                if i_end > i_start then
-                    local mid_k = math.min(total_pts, math.floor((i_start + i_end) * 0.5))
-                    local t_freq = (total_pts > 1) and ((mid_k - 1) / total_pts) or 0.0
-                    local t_color = (color_mode == 2) and outer_val[mid_k] or t_freq
-                    local r_b, g_b, b_b, a_b = get_band_color(t_color, color_mode, c1, c2, c3, opacity)
+        end
 
+        local total_pts = #outer_x
+        if is_closed and total_pts >= 3 then
+            local fill_sh = Shape()
+            fill_sh:MoveTo(outer_x[1], outer_y[1])
+            for k = 2, total_pts do fill_sh:LineTo(outer_x[k], outer_y[k]) end
+            fill_sh:Close()
+            local r_f, g_f, b_f, a_f = get_band_color(0.35, color_mode, c1, c2, c3, opacity, hue_interp)
+            draw_shape(out, fill_sh, r_f, g_f, b_f, a_f * 0.14, quality)
+        end
+
+        local buckets = math.min(num_bands, 24)
+        for b = 1, buckets do
+            local i_start = math.max(1, math.floor(((b - 1) / buckets) * (total_pts - 1)) + 1)
+            local i_end = is_closed and math.min(total_pts + 1, math.floor((b / buckets) * total_pts) + 1)
+                                    or math.min(total_pts, math.floor((b / buckets) * (total_pts - 1)) + 1)
+            if i_end > i_start then
+                local mid_k = math.min(total_pts, math.floor((i_start + i_end) * 0.5))
+                local t_freq = (total_pts > 1) and ((mid_k - 1) / total_pts) or 0.0
+                local t_color = (color_mode == 2) and outer_val[mid_k] or t_freq
+                local r_b, g_b, b_b, a_b = get_band_color(t_color, color_mode, c1, c2, c3, opacity, hue_interp)
+                local gr, gg, gb, ga = r_b, g_b, b_b, a_b
+                if color_mode == 0 then
+                    gr, gg, gb = shift_hue(c3.R, c3.G, c3.B, t_freq * hue_interp)
+                    ga = c3.A * opacity
+                end
+
+                if side_mode ~= 1 then
                     local seg_sh = Shape()
                     seg_sh:MoveTo(outer_x[i_start], outer_y[i_start])
                     for k = i_start + 1, i_end do
-                        local kk = ((k - 1) % total_pts) + 1
+                        local kk = is_closed and (((k - 1) % total_pts) + 1) or k
                         seg_sh:LineTo(outer_x[kk], outer_y[kk])
                     end
                     if halo > 0.01 then
-                        draw_shape(out, seg_sh:OutlineOfShape(line_w * 3.0, "OLT_Solid"), r_b, g_b, b_b, a_b * 0.25 * halo, quality)
+                        draw_shape(out, seg_sh:OutlineOfShape(line_w * (2.5 + 3.0 * halo), "OLT_Solid"), gr, gg, gb, ga * 0.18 * halo, quality)
+                        draw_shape(out, seg_sh:OutlineOfShape(line_w * (1.5 + 1.5 * halo), "OLT_Solid"), gr, gg, gb, ga * 0.35 * halo, quality)
                     end
                     draw_shape(out, seg_sh:OutlineOfShape(line_w, "OLT_Solid"), r_b, g_b, b_b, a_b, quality)
                 end
-            end
-        end
 
-        if inner_x then
-            local inner_sh = Shape()
-            inner_sh:MoveTo(inner_x[1], inner_y[1])
-            for k = 2, #inner_x do
-                inner_sh:LineTo(inner_x[k], inner_y[k])
+                if inner_x then
+                    local in_seg = Shape()
+                    in_seg:MoveTo(inner_x[i_start], inner_y[i_start])
+                    for k = i_start + 1, i_end do
+                        local kk = is_closed and (((k - 1) % total_pts) + 1) or k
+                        in_seg:LineTo(inner_x[kk], inner_y[kk])
+                    end
+                    if halo > 0.01 then
+                        draw_shape(out, in_seg:OutlineOfShape(line_w * (1.5 + 1.5 * halo), "OLT_Solid"), gr, gg, gb, ga * 0.28 * halo, quality)
+                    end
+                    draw_shape(out, in_seg:OutlineOfShape(line_w, "OLT_Solid"), r_b, g_b, b_b, a_b * 0.85, quality)
+                end
             end
-            inner_sh:LineTo(inner_x[1], inner_y[1])
-            inner_sh:Close()
-            draw_shape(out, inner_sh:OutlineOfShape(line_w, "OLT_Solid"), c2.R, c2.G, c2.B, a_main * 0.85, quality)
         end
     end
 end
@@ -1958,24 +2148,32 @@ function Process(req)
     if wav then
         levels, peaks = compute_smoothed_spectrum(wav, math.floor(req.Time + 0.5), params)
     elseif filepath and filepath ~= "" and wav_err then
-        -- Non-fatal log so user can diagnose path/format in Fusion Console
         print("[AudioSpectrumAnalyzer] " .. tostring(wav_err) .. " (" .. tostring(filepath) .. ")")
     end
 
+    local start_pt = InStartPoint:GetValue(req)
+    local end_pt = InEndPoint:GetValue(req)
     local center = InCenter:GetValue(req)
     local opts = {
         quick = req:IsQuick(),
         style = math.floor(InStyle:GetValue(req).Value + 0.5),
-        mirror = (InMirror:GetValue(req).Value > 0.5),
+        side_mode = math.floor(InSideOptions:GetValue(req).Value + 0.5),
         peak_hold = peak_hold,
+        placement_mode = math.floor(InPlacementMode:GetValue(req).Value + 0.5),
+        start_x = start_pt.X,
+        start_y = start_pt.Y,
+        end_x = end_pt.X,
+        end_y = end_pt.Y,
         center_x = center.X,
         center_y = center.Y,
         graph_w = InGraphWidth:GetValue(req).Value,
         graph_h = InGraphHeight:GetValue(req).Value,
         bar_gap = InBarGap:GetValue(req).Value,
         line_w = InLineWidth:GetValue(req).Value,
+        round_caps = (InRoundCaps:GetValue(req).Value > 0.5),
         inner_r = InInnerRadius:GetValue(req).Value,
         rotation = InRotation:GetValue(req).Value,
+        arc_sweep = InArcSweep:GetValue(req).Value,
         show_grid = (InShowGrid:GetValue(req).Value > 0.5),
         grid_opacity = InGridOpacity:GetValue(req).Value,
         bg_opacity = InBgOpacity:GetValue(req).Value,
@@ -2010,6 +2208,7 @@ function Process(req)
             B = InPeakB:GetValue(req).Value,
             A = InPeakA:GetValue(req).Value,
         },
+        hue_interp = InHueInterp:GetValue(req).Value,
         led_segments = math.max(4, math.min(48, math.floor(InLedSegments:GetValue(req).Value + 0.5))),
         halo = InHaloGlow:GetValue(req).Value,
         opacity = InSpectrumOpacity:GetValue(req).Value,

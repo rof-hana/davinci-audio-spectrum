@@ -33,20 +33,20 @@
 					Source = "VisualStyle",
 					Default = 0,
 				},
+				InputSideOptions = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "SideOptions",
+					Default = 2,
+				},
 				InputBands = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "Bands",
 					Default = 48,
 				},
-				InputMirrorMode = InstanceInput {
-					SourceOp = "AudioSpectrum1",
-					Source = "MirrorMode",
-					Default = 0,
-				},
 				InputPeakHold = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "PeakHold",
-					Default = 1,
+					Default = 0,
 				},
 
 				InputFFTSize = InstanceInput {
@@ -68,7 +68,7 @@
 				InputMinFreq = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "MinFreq",
-					Default = 30,
+					Default = 20,
 				},
 				InputMaxFreq = InstanceInput {
 					SourceOp = "AudioSpectrum1",
@@ -106,10 +106,27 @@
 					Default = 0.025,
 				},
 
+				InputPlacementMode = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "PlacementMode",
+					Page = "Layout",
+					Default = 0,
+				},
+				InputStartPoint = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "StartPoint",
+					DefaultX = 0.12,
+					DefaultY = 0.5,
+				},
+				InputEndPoint = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "EndPoint",
+					DefaultX = 0.88,
+					DefaultY = 0.5,
+				},
 				InputCenter = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "Center",
-					Page = "Layout",
 					DefaultX = 0.5,
 					DefaultY = 0.5,
 				},
@@ -121,7 +138,7 @@
 				InputGraphHeight = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "GraphHeight",
-					Default = 0.45,
+					Default = 0.42,
 				},
 				InputBarGap = InstanceInput {
 					SourceOp = "AudioSpectrum1",
@@ -131,7 +148,12 @@
 				InputLineWidth = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "LineWidth",
-					Default = 0.003,
+					Default = 0.0035,
+				},
+				InputRoundCaps = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "RoundCaps",
+					Default = 1,
 				},
 				InputInnerRadius = InstanceInput {
 					SourceOp = "AudioSpectrum1",
@@ -143,10 +165,15 @@
 					Source = "Rotation",
 					Default = 0,
 				},
+				InputArcSweep = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "ArcSweep",
+					Default = 360,
+				},
 				InputShowGrid = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "ShowGrid",
-					Default = 1,
+					Default = 0,
 				},
 				InputGridOpacity = InstanceInput {
 					SourceOp = "AudioSpectrum1",
@@ -188,20 +215,20 @@
 					SourceOp = "AudioSpectrum1",
 					Source = "ColorMode",
 					Page = "Color",
-					Default = 1,
+					Default = 0,
 				},
 				InputLowRed = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "LowRed",
-					Name = "Primary / Low Color",
+					Name = "Inside / Low Color",
 					ControlGroup = 1,
-					Default = 0,
+					Default = 0.92,
 				},
 				InputLowGreen = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "LowGreen",
 					ControlGroup = 1,
-					Default = 0.85,
+					Default = 0.98,
 				},
 				InputLowBlue = InstanceInput {
 					SourceOp = "AudioSpectrum1",
@@ -215,10 +242,35 @@
 					ControlGroup = 1,
 					Default = 1,
 				},
+				InputHighRed = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HighRed",
+					Name = "Outside / High Color",
+					ControlGroup = 3,
+					Default = 1,
+				},
+				InputHighGreen = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HighGreen",
+					ControlGroup = 3,
+					Default = 0.16,
+				},
+				InputHighBlue = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HighBlue",
+					ControlGroup = 3,
+					Default = 0.62,
+				},
+				InputHighAlpha = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "HighAlpha",
+					ControlGroup = 3,
+					Default = 1,
+				},
 				InputMidRed = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "MidRed",
-					Name = "Mid Color",
+					Name = "Mid Color (3-Color Grad)",
 					ControlGroup = 2,
 					Default = 0.45,
 				},
@@ -238,31 +290,6 @@
 					SourceOp = "AudioSpectrum1",
 					Source = "MidAlpha",
 					ControlGroup = 2,
-					Default = 1,
-				},
-				InputHighRed = InstanceInput {
-					SourceOp = "AudioSpectrum1",
-					Source = "HighRed",
-					Name = "High / Peak Color",
-					ControlGroup = 3,
-					Default = 1,
-				},
-				InputHighGreen = InstanceInput {
-					SourceOp = "AudioSpectrum1",
-					Source = "HighGreen",
-					ControlGroup = 3,
-					Default = 0.22,
-				},
-				InputHighBlue = InstanceInput {
-					SourceOp = "AudioSpectrum1",
-					Source = "HighBlue",
-					ControlGroup = 3,
-					Default = 0.55,
-				},
-				InputHighAlpha = InstanceInput {
-					SourceOp = "AudioSpectrum1",
-					Source = "HighAlpha",
-					ControlGroup = 3,
 					Default = 1,
 				},
 				InputPeakRed = InstanceInput {
@@ -290,15 +317,20 @@
 					ControlGroup = 4,
 					Default = 1,
 				},
-				InputLedSegments = InstanceInput {
+				InputHueInterp = InstanceInput {
 					SourceOp = "AudioSpectrum1",
-					Source = "LedSegments",
-					Default = 18,
+					Source = "HueInterp",
+					Default = 0,
 				},
 				InputHaloGlow = InstanceInput {
 					SourceOp = "AudioSpectrum1",
 					Source = "HaloGlow",
-					Default = 0.25,
+					Default = 0.35,
+				},
+				InputLedSegments = InstanceInput {
+					SourceOp = "AudioSpectrum1",
+					Source = "LedSegments",
+					Default = 18,
 				},
 				InputSpectrumOpacity = InstanceInput {
 					SourceOp = "AudioSpectrum1",
